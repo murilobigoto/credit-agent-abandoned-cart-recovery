@@ -1,0 +1,2843 @@
+================================================================================
+ARQUIVO: ./app.py
+================================================================================
+"""Ponto de entrada da simulação PoneIU.
+
+Execute com:
+
+    streamlit run app.py
+
+Ver README.md para instruções completas de instalação e docs/ARQUITETURA.md
+para o racional de design do ecossistema de agentes por trás desta tela.
+"""
+
+from __future__ import annotations
+
+import streamlit as st
+
+from src.config import BANCO_NOME
+from src.services.poneiu_api import PoneIUBankAPI
+from src.ui import components
+from src.ui.styles import CSS
+
+st.set_page_config(
+    page_title=f"{BANCO_NOME} | Soluções de dívidas",
+    page_icon="🤝",
+    layout="centered",
+)
+st.markdown(CSS, unsafe_allow_html=True)
+
+if "carrinho_ativo_id" not in st.session_state:
+    st.session_state["carrinho_ativo_id"] = None
+
+
+@st.cache_resource
+def _api() -> PoneIUBankAPI:
+    return PoneIUBankAPI()
+
+
+api = _api()
+carrinhos = api.listar_carrinhos_abandonados()
+maior_desconto = max(
+    (api.gerar_cardapio_completo(carrinho.cart_id)[0].desconto_percentual for carrinho in carrinhos),
+    default=0.0,
+)
+
+components.render_header()
+components.render_hero(carrinhos)
+components.render_resumo(carrinhos, maior_desconto)
+components.render_desenrola_card()
+components.render_formas_reorganizar(carrinhos)
+components.render_ajuda()
+components.render_footer()
+
+carrinho_ativo_id = st.session_state.get("carrinho_ativo_id")
+if carrinho_ativo_id:
+    carrinho_ativo = api.obter_carrinho(carrinho_ativo_id)
+    if carrinho_ativo is not None:
+        components.abrir_chat_dialog(carrinho_ativo)
+
+
+================================================================================
+ARQUIVO: ./conftest.py
+================================================================================
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+
+================================================================================
+ARQUIVO: ./docs/ARQUITETURA.md
+================================================================================
+# Arquitetura do ecossistema agêntico PoneIU
+
+Este documento explica **como** o sistema foi construído e, principalmente,
+**por quê** — as decisões de design, a teoria de LangGraph por trás delas, e
+os trade-offs que foram conscientemente aceitos por se tratar de um projeto
+de demonstração/portfólio, não de um sistema em produção.
+
+Índice:
+
+1. [Visão geral do domínio](#1-visão-geral-do-domínio)
+2. [Por que LangGraph, e a teoria por trás do grafo](#2-por-que-langgraph-e-a-teoria-por-trás-do-grafo)
+3. [Topologia do grafo](#3-topologia-do-grafo)
+4. [O agente geral (supervisor/gatekeeper)](#4-o-agente-geral-supervisorgatekeeper)
+5. [O agente de renegociação (especialista)](#5-o-agente-de-renegociação-especialista)
+6. [Estado e persistência (checkpointer)](#6-estado-e-persistência-checkpointer)
+7. [Onde o LLM entra — e onde ele deliberadamente NÃO entra](#7-onde-o-llm-entra--e-onde-ele-deliberadamente-não-entra)
+8. [A API mock do PoneIU](#8-a-api-mock-do-poneiu)
+9. [Camada de apresentação (Streamlit)](#9-camada-de-apresentação-streamlit)
+10. [Limitações conhecidas e próximos passos](#10-limitações-conhecidas-e-próximos-passos)
+
+---
+
+## 1. Visão geral do domínio
+
+O cenário simulado: um cliente do banco fictício **PoneIU** já havia entrado
+no app, simulado uma renegociação de dívida (cartão, LIC ou Pronampe), viu
+as condições e **não contratou** — um "carrinho abandonado" de
+renegociação. Ele volta à tela de "Solução de dívidas", vê a lista de
+simulações não finalizadas e decide retomar uma delas.
+
+O ecossistema de agentes precisa fazer três coisas bem feitas:
+
+1. **Reconhecer** quando o cliente realmente quer retomar a negociação
+   (e só nesse caso avançar para a parte transacional).
+2. **Tratar com humanidade** qualquer outra coisa que o cliente diga —
+   principalmente desabafos sobre dificuldade financeira — sem fingir ser
+   um consultor financeiro completo nem inventar condições de crédito.
+3. **Conduzir a renegociação** de forma determinística e auditável: pedir
+   quanto o cliente pode pagar, consultar o "sistema" (API mock) e devolver
+   as duas ofertas mais aderentes.
+
+## 2. Por que LangGraph, e a teoria por trás do grafo
+
+Um chatbot bancário transacional não é um problema de "uma chamada de LLM
+resolve tudo" — ele é uma **máquina de estados conversacional** com regras
+de negócio rígidas (nunca inventar taxa de juros, sempre seguir a
+sequência pedir-valor → mostrar-opções → confirmar) intercaladas com
+trechos que se beneficiam de linguagem natural flexível (acolher um
+desabafo, redigir uma mensagem com tom humano).
+
+[LangGraph](https://langchain-ai.github.io/langgraph/) foi escolhido porque
+modela exatamente esse híbrido:
+
+- **Grafo de estados explícito**: nós são funções Python determinísticas
+  (podem chamar um LLM ou não); arestas condicionais decidem o próximo nó
+  com base no estado atual. Isso é diferente de um "agent loop" onde um
+  único LLM decide livremente qual ferramenta chamar a cada passo — aqui,
+  quem decide o fluxo é o **código**, e o LLM é convocado pontualmente
+  dentro de cada nó. Para um fluxo bancário regulado, esse controle
+  explícito é uma escolha deliberada, não uma limitação.
+- **Estado tipado e compartilhado** (`AgentState`, um `TypedDict`): todos os
+  nós leem e escrevem no mesmo "quadro branco", com reducers explícitos
+  (`add_messages` para o histórico de chat) definindo como atualizações
+  parciais se combinam com o estado anterior.
+- **Checkpointer plugável**: LangGraph persiste o estado entre invocações
+  por `thread_id`, dando de graça o comportamento de "memória de conversa"
+  que um chatbot real precisa, sem o desenvolvedor ter que implementar cache
+  de sessão na mão. Ver [seção 6](#6-estado-e-persistência-checkpointer).
+- **Multiagente por composição de grafos**: cada "agente" aqui é, na
+  prática, um nó (ou pequeno subconjunto de nós) com sua própria persona e
+  responsabilidade. Isso segue o padrão *supervisor* descrito na própria
+  documentação do LangGraph para sistemas multiagente: um nó orquestrador
+  decide para qual especialista rotear, em vez de um único agente
+  monolítico tentar fazer tudo.
+
+## 3. Topologia do grafo
+
+```mermaid
+flowchart TD
+    START((START)) --> GERAL[agente_geral<br/>gatekeeper/triagem]
+    GERAL -- "intenção = retomar<br/>ou resposta direta ao fluxo" --> RENEG[agente_renegociacao<br/>especialista]
+    GERAL -- "qualquer outra coisa<br/>(resposta humanizada)" --> FIM((END))
+    RENEG --> FIM2((END))
+```
+
+Implementado em [`src/agents/graph.py`](../src/agents/graph.py):
+
+```python
+builder = StateGraph(AgentState)
+builder.add_node("agente_geral", nodo_agente_geral)
+builder.add_node("agente_renegociacao", nodo_agente_renegociacao)
+
+builder.add_edge(START, "agente_geral")
+builder.add_conditional_edges(
+    "agente_geral",
+    rotear_apos_triagem,
+    {"renegociacao": "agente_renegociacao", "fim": END},
+)
+builder.add_edge("agente_renegociacao", END)
+```
+
+O grafo é invocado **uma vez por mensagem do cliente** (o padrão
+"turn-by-turn" recomendado pelo LangGraph para chatbots): a UI chama
+`grafo.invoke({"messages": [nova_mensagem]}, config={"thread_id": ...})`,
+o `agente_geral` sempre roda primeiro, e a aresta condicional decide se o
+turno termina ali (resposta humanizada) ou segue para o especialista.
+
+## 4. O agente geral (supervisor/gatekeeper)
+
+Arquivo: [`src/agents/agente_geral.py`](../src/agents/agente_geral.py).
+
+Este nó implementa literalmente a regra de negócio pedida no escopo do
+projeto: **qualquer mensagem que não seja sobre retomar a renegociação
+recebe uma resposta humana e encerra a conversa.** A implementação segue
+esta ordem de decisão a cada turno:
+
+1. **A renegociação já foi concluída?** Não reclassifica nada — repassa
+   para o especialista, que sabe responder com o protocolo final. Isso
+   evita duplicar lógica de "já terminou" em dois lugares.
+2. **A conversa tinha sido encerrada humanizadamente antes?** Um
+   encerramento não é permanente: se o cliente voltar e demonstrar
+   intenção clara de retomar, a triagem roda de novo do zero.
+3. **Estamos no meio do fluxo, aguardando um dado específico** (o valor que
+   o cliente pode pagar, ou a escolha entre as duas ofertas)? Se a
+   mensagem **é reconhecível como essa resposta** (um valor em reais, ou
+   "1"/"2"/"a primeira"/"a segunda"), pulamos direto para o especialista
+   **sem** chamar o classificador de intenção. Isso é importante: um
+   classificador genérico de "retomar vs. outro" tende a não saber o que
+   fazer com uma resposta como `"300"` — pular essa reclassificação evita
+   falsos negativos.
+4. **A resposta não foi reconhecida, mas contém um sinal explícito de
+   desistência/desabafo** ("perdi o emprego", "não aguento mais", "quero
+   cancelar", etc.)? Aí sim a conversa é encerrada com uma resposta
+   humanizada. Uma resposta apenas incerta ("não sei", "sei lá") **não**
+   encerra a conversa — ela é passada ao especialista, que sabe reperguntar
+   com naturalidade. Essa distinção foi um ajuste deliberado depois de
+   testar o fluxo: encerrar a conversa toda vez que o cliente hesita seria
+   uma péssima experiência para um chatbot bancário real.
+5. Só quando nada acima se aplica é que o **classificador de intenção**
+   (`classificar_intencao`, [seção 7](#7-onde-o-llm-entra--e-onde-ele-deliberadamente-não-entra))
+   é chamado para decidir entre `retomar_renegociacao` e `outro`.
+
+```python
+def rotear_apos_triagem(state: AgentState) -> str:
+    if _estagio_atual(state) == Estagio.ENCERRADO_HUMANO:
+        return "fim"
+    return "renegociacao"
+```
+
+## 5. O agente de renegociação (especialista)
+
+Arquivo: [`src/agents/agente_renegociacao.py`](../src/agents/agente_renegociacao.py).
+
+É uma máquina de estados simples de 3 passos, guiada pelo campo `estagio`
+do estado compartilhado (enum `Estagio` em
+[`src/agents/state.py`](../src/agents/state.py)):
+
+```mermaid
+stateDiagram-v2
+    [*] --> INICIO
+    INICIO --> AGUARDANDO_VALOR: mensagem de boas-vindas<br/>(contexto do carrinho abandonado)
+    AGUARDANDO_VALOR --> AGUARDANDO_VALOR: valor não reconhecido<br/>(repergunta)
+    AGUARDANDO_VALOR --> AGUARDANDO_ESCOLHA: consulta a API mock<br/>e apresenta 2 ofertas
+    AGUARDANDO_ESCOLHA --> AGUARDANDO_ESCOLHA: escolha não reconhecida<br/>(repergunta)
+    AGUARDANDO_ESCOLHA --> CONCLUIDO: confirma contratação<br/>(protocolo gerado)
+    CONCLUIDO --> [*]
+```
+
+Cada transição só acontece depois de uma validação determinística (extração
+de valor monetário ou de escolha de oferta, em
+[`src/utils.py`](../src/utils.py)) — o LLM nunca decide sozinho se o
+cliente "já respondeu o suficiente"; quem decide é o código.
+
+## 6. Estado e persistência (checkpointer)
+
+O LangGraph usa um `MemorySaver` (checkpointer em memória, ver
+[`src/agents/graph.py`](../src/agents/graph.py)) chaveado por `thread_id`.
+Neste projeto, **um `thread_id` = um carrinho abandonado** (`cart_id`).
+Isso dá, de graça:
+
+- Memória de conversa entre mensagens (o especialista sabe em que estágio
+  parou sem a UI precisar reenviar o histórico inteiro a cada turno).
+- Isolamento entre produtos: a conversa sobre o Cartão não vaza estado para
+  a conversa sobre o Pronampe, porque são threads diferentes.
+- Idempotência de abertura: `orquestrador.iniciar_conversa` (em
+  [`src/agents/orquestrador.py`](../src/agents/orquestrador.py)) primeiro
+  checa se aquela thread já tem histórico antes de mandar a mensagem
+  sintética de abertura — reabrir a "janelinha" de chat não duplica a
+  saudação.
+
+Um detalhe de engenharia relevante: o checkpointer serializa o estado via
+msgpack. Por isso, `AgentState` **nunca** guarda dataclasses/enums do
+domínio diretamente (`CarrinhoAbandonado`, `OfertaRenegociacao`) — apenas
+`dict`s simples, produzidos pelos métodos `to_dict()`/`from_dict()` em
+[`src/domain/models.py`](../src/domain/models.py). Guardar objetos Python
+arbitrários no estado funciona "por acidente" via pickle-fallback, mas o
+próprio LangGraph avisa que esse fallback será bloqueado em versões
+futuras — então a fronteira estado-do-grafo ↔ modelos-de-domínio foi
+desenhada para ser sempre serializável.
+
+Em produção, `MemorySaver` seria trocado por um checkpointer persistente
+(Postgres, Redis, etc.) sem tocar em nenhum nó do grafo — é só trocar a
+peça no `builder.compile(checkpointer=...)`.
+
+## 7. Onde o LLM entra — e onde ele deliberadamente NÃO entra
+
+Esta é a decisão de design mais importante do projeto, então merece
+destaque: **nenhum valor financeiro (parcela, taxa, total, desconto) é
+gerado por um LLM.** Todos vêm da API mock (`src/services/poneiu_api.py`) e
+o papel do LLM é só *comunicá-los* — nunca calculá-los, arredondá-los ou
+parafraseá-los de um jeito que possa alterar o número. Isso elimina, por
+construção, o principal risco de um chatbot bancário com LLM: alucinar uma
+condição de crédito que o banco não pode cumprir.
+
+Onde o LLM (`langchain-anthropic` / Claude) é usado, em
+[`src/agents/llm.py`](../src/agents/llm.py):
+
+| Função | Papel do LLM | Fallback sem `ANTHROPIC_API_KEY` |
+|---|---|---|
+| `classificar_intencao` | Desambiguar, via `with_structured_output`, se uma mensagem ambígua é um pedido de retomada | Heurística por palavras-chave (`"retomar"`, `"continuar"`, ...); se nada bater, assume `"outro"` (postura conservadora na entrada da conversa) |
+| `gerar_resposta_humanizada` | Redigir a resposta empática/de encerramento com a persona da Aline (`PERSONA_GERAL`) | Um de três textos de encerramento pré-escritos, escolhidos de forma estável por hash da mensagem |
+| `gerar_texto_livre` | Dar um verniz de naturalidade às mensagens do especialista (saudação, apresentação de ofertas, confirmação) — o conteúdo numérico já vem pronto no prompt | Devolve o texto-base (já escrito em tom natural) sem alteração |
+
+Ou seja: **o projeto roda 100% funcional sem nenhuma chave de API** — modo
+"simulado" — porque cada função tem um fallback determinístico. Isso foi
+uma escolha consciente para que o repositório seja fácil de clonar, avaliar
+e testar (inclusive em CI) sem exigir credenciais. Com a chave configurada
+(ver `.env.example`), as respostas do agente geral passam a ser geradas
+pelo Claude com a persona configurada em
+[`src/agents/prompts.py`](../src/agents/prompts.py).
+
+### Classificação com saída estruturada
+
+`classificar_intencao` usa `llm.with_structured_output(ClassificacaoIntencao)`
+— um `BaseModel` Pydantic com um campo `Literal["retomar_renegociacao",
+"outro"]` — em vez de pedir "responda com uma palavra" e fazer parsing
+manual da string. Isso é o padrão moderno de "structured output"/"tool
+calling" do LangChain: o modelo é forçado (via function calling da API da
+Anthropic) a devolver um JSON que já bate com o schema Python, eliminando
+uma classe inteira de bugs de parsing.
+
+## 8. A API mock do PoneIU
+
+Arquivo: [`src/services/poneiu_api.py`](../src/services/poneiu_api.py).
+Simula o "hub de renegociação" de um banco real:
+
+- `listar_carrinhos_abandonados()` / `obter_carrinho(cart_id)`: carteira
+  fixa com 3 simulações não finalizadas (uma por produto — Cartão, LIC,
+  Pronampe), cada uma com saldo devedor, dias em atraso e a oferta que o
+  cliente tinha visto e não contratado.
+- `gerar_cardapio_completo(cart_id)`: gera as combinações de prazo
+  disponíveis para o produto daquele carrinho, com taxa mensal calculada
+  pela **Tabela Price** (amortização francesa) e um desconto de encargos
+  maior para prazos mais curtos — political de "quanto antes quitar, maior
+  o desconto", comum em campanhas reais de renegociação.
+- `simular_opcoes_mais_proximas(cart_id, valor_pretendido, max_opcoes=2)`:
+  ordena o cardápio completo pela diferença absoluta entre a parcela de
+  cada oferta e o valor que o cliente disse conseguir pagar, devolvendo as
+  `max_opcoes` mais próximas — é exatamente o requisito de negócio "traga o
+  mais próximo possível em duas opções".
+- `confirmar_contratacao(cart_id, oferta)`: gera um protocolo
+  (`PONEIU-XXXXXXXXXX`) simulando a contratação.
+
+As taxas por produto refletem, de forma simplificada, o perfil de risco e
+funding reais de cada linha (ver comentário no topo do arquivo): cartão
+rotativo vencido tem a taxa mais alta; Pronampe, por ser uma linha para
+PJ com funding subsidiado pelo governo, tem a taxa mais baixa e os prazos
+mais longos. A "aleatoriedade" (pequenas variações de centavos) usa uma
+seed derivada do `cart_id`, então a demo é 100% determinística e
+reprodutível entre execuções — importante para os testes automatizados em
+[`tests/`](../tests/).
+
+## 9. Camada de apresentação (Streamlit)
+
+- [`app.py`](../app.py): ponto de entrada (`streamlit run app.py`).
+- [`src/ui/styles.py`](../src/ui/styles.py): CSS injetado para simular um
+  app bancário real — largura de celular, esconder o chrome padrão do
+  Streamlit, transformar `st.button` em linhas de lista com chevron.
+- [`src/ui/components.py`](../src/ui/components.py): os blocos visuais da
+  tela ("Solução de dívidas", card "Novo Desenrola PoneIU", seção "Formas
+  de reorganizar") e a "janelinha" de chat.
+
+A "janelinha" conversacional é implementada com `st.dialog`, o modal nativo
+do Streamlit (≥ 1.31). O padrão usado é o recomendado pela documentação do
+Streamlit para diálogos "persistentes": qual carrinho está ativo vive em
+`st.session_state["carrinho_ativo_id"]`, e a função decorada com
+`@st.dialog(...)` é chamada condicionalmente a cada rerun **enquanto**
+aquele estado apontar para um carrinho — cliques em botões e o
+`st.chat_input` dentro do diálogo disparam reruns normais do Streamlit, e o
+diálogo permanece aberto porque a condição continua verdadeira.
+
+O clique do cliente em uma linha da lista ("CARTÃO PONEIU",
+etc.) já **é**, na simulação, a manifestação de "quero retomar minha
+renegociação" — por isso a UI não precisa de um caminho especial: ela só
+chama `orquestrador.iniciar_conversa(carrinho)`, que injeta uma mensagem
+sintética equivalente e deixa o `agente_geral` processá-la normalmente
+como porta de entrada única do grafo.
+
+## 10. Limitações conhecidas e próximos passos
+
+Este é um projeto de demonstração — as simplificações abaixo são
+conscientes, não descuido:
+
+- **Sem autenticação/autorização real**: não há verificação de identidade
+  do cliente; a "carteira" de carrinhos é fixa e compartilhada.
+- **Checkpointer em memória**: o histórico de conversa some quando o
+  processo Streamlit reinicia. Trocar por um checkpointer persistente
+  (Postgres/Redis) é uma mudança de uma linha em `graph.py`.
+- **Classificador de intenção sem LLM é só heurístico**: cobre os casos de
+  demonstração, mas não substitui um classificador real treinado/avaliado
+  para produção.
+- **Sem observabilidade/tracing**: um sistema real se beneficiaria de
+  LangSmith (ou equivalente) para depurar decisões do grafo em produção.
+- **Sem testes de carga/concorrência**: o `MemorySaver` não foi pensado
+  para múltiplas instâncias do processo Streamlit rodando ao mesmo tempo.
+
+Extensões naturais: adicionar um quarto "produto" ao mock, um nó de
+auditoria/compliance que registra cada oferta apresentada, ou um passo de
+"segunda confirmação" (ex.: OTP) antes de `confirmar_contratacao`.
+
+
+================================================================================
+ARQUIVO: ./README.md
+================================================================================
+# PoneIU · Ecossistema agêntico de renegociação de carrinho abandonado
+
+
+Simulação completa — agentes de IA + interface bancária — de um fluxo real
+de **retomada de renegociação de dívida** para um banco fictício chamado
+**PoneIU**. O cliente entra na tela de "Solução de dívidas", clica em uma
+simulação que ele começou e não contratou (um "carrinho abandonado") e
+conversa com um ecossistema de agentes construído em **LangGraph** que:
+
+1. Filtra, de forma humana, qualquer mensagem que **não** seja sobre
+   retomar a negociação (inclusive desabafos sobre dificuldade financeira)
+   e encerra a conversa com empatia — sem fingir ser um consultor
+   financeiro completo.
+2. Quando o cliente quer mesmo retomar, conduz a negociação: pergunta
+   quanto ele pode pagar por mês e devolve, via uma **API mock do PoneIU**,
+   as **duas ofertas mais próximas** daquele valor (cartão, LIC ou
+   Pronampe).
+3. Confirma a escolha do cliente e "contrata" a oferta, gerando um
+   protocolo — como um sistema bancário real faria.
+
+A interface é feita em **Streamlit** e reproduz o layout de uma tela real
+de app bancário de soluções de dívidas (referência de design fornecida
+pelo usuário).
+
+| Tela principal | Chat — abertura | Chat — ofertas | Chat — confirmação | Chat — gatekeeper humanizado |
+|---|---|---|---|---|
+| ![Tela principal](docs/screenshots/01_tela_principal.png) | ![Abertura do chat](docs/screenshots/02_chat_abertura.png) | ![Apresentação de ofertas](docs/screenshots/03_chat_ofertas.png) | ![Confirmação](docs/screenshots/04_chat_confirmacao.png) | ![Encerramento humanizado](docs/screenshots/05_chat_gatekeeper.png) |
+
+> Para a teoria por trás da arquitetura (por que LangGraph, desenho do
+> grafo, onde o LLM entra e onde ele deliberadamente não entra, etc.), veja
+> **[docs/ARQUITETURA.md](docs/ARQUITETURA.md)**.
+
+---
+
+## Sumário
+
+- [Como rodar](#como-rodar)
+- [Rodando com ou sem chave de API (modo simulado)](#rodando-com-ou-sem-chave-de-api-modo-simulado)
+- [Rodando os testes](#rodando-os-testes)
+- [Estrutura do projeto](#estrutura-do-projeto)
+- [Como usar a demo](#como-usar-a-demo)
+- [Aviso importante](#aviso-importante)
+
+## Como rodar
+
+Pré-requisito: Python 3.11+.
+
+```bash
+# 1. Clone o repositório
+git clone <url-do-seu-repo>
+cd poneiu-renegocia-agentic
+
+# 2. Crie e ative um ambiente virtual
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+
+# 3. Instale as dependências
+pip install -r requirements.txt
+
+# 4. (Opcional) configure sua chave da Anthropic para respostas via LLM real
+cp .env.example .env
+# edite .env e preencha ANTHROPIC_API_KEY=sk-...
+
+# 5. Rode a aplicação
+streamlit run app.py
+```
+
+O Streamlit vai abrir automaticamente `http://localhost:8501` no navegador.
+
+## Rodando com ou sem chave de API (modo simulado)
+
+O ecossistema **funciona sem nenhuma chave de API**. Se
+`ANTHROPIC_API_KEY` não estiver definida em `.env`, todos os agentes caem
+para um **modo simulado** determinístico:
+
+- O classificador de intenção usa uma heurística por palavras-chave.
+- As respostas humanizadas do agente geral usam textos de encerramento
+  pré-escritos (variados, não um script único repetido).
+- As mensagens do agente de renegociação (saudação, ofertas, confirmação)
+  já são escritas em tom natural nos templates — o LLM, quando disponível,
+  só dá um verniz extra de naturalidade, nunca altera os números.
+
+Isso permite clonar o repositório e testar o fluxo inteiro **sem custo e
+sem credenciais**. Com a chave configurada, o agente geral passa a gerar
+as respostas de acolhimento/encerramento com Claude (modelo configurável
+via `PONEIU_MODEL_NAME` no `.env`, padrão `claude-sonnet-5`).
+
+## Rodando os testes
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Os testes cobrem a API mock (determinismo, seleção das ofertas mais
+próximas), os utilitários de extração de valor/escolha em linguagem
+natural, e o grafo de agentes de ponta a ponta (fluxo feliz, encerramento
+humanizado, reabertura de conversa) — tudo em modo simulado, sem exigir
+chave de API.
+
+## Estrutura do projeto
+
+```
+.
+├── app.py                        # streamlit run app.py
+├── src/
+│   ├── config.py                 # variáveis de ambiente e marca PoneIU
+│   ├── utils.py                  # extração de valor/escolha, formatação BRL
+│   ├── domain/
+│   │   └── models.py             # Produto, CarrinhoAbandonado, OfertaRenegociacao, ...
+│   ├── services/
+│   │   └── poneiu_api.py         # mock da API core-banking do PoneIU
+│   ├── agents/
+│   │   ├── state.py              # AgentState (TypedDict) e Estagio (enum)
+│   │   ├── prompts.py            # personas e instruções dos agentes
+│   │   ├── llm.py                # acesso ao Claude + fallback simulado
+│   │   ├── agente_geral.py       # gatekeeper/triagem
+│   │   ├── agente_renegociacao.py# especialista (máquina de estados)
+│   │   ├── graph.py              # montagem do StateGraph do LangGraph
+│   │   └── orquestrador.py       # fachada usada pela UI
+│   └── ui/
+│       ├── styles.py             # CSS (layout "app bancário")
+│       └── components.py         # telas e a "janelinha" de chat (st.dialog)
+├── tests/                        # pytest
+└── docs/
+    ├── ARQUITETURA.md            # teoria e racional de design
+    └── screenshots/
+```
+
+## Como usar a demo
+
+1. Na tela principal, veja a seção **"Formas de reorganizar"** com as
+   simulações não finalizadas: Cartão, LIC e Pronampe.
+2. Clique em uma delas — isso abre a "janelinha" de chat já contextualizada
+   com o produto e a oferta que você tinha visto antes.
+3. Digite quanto você conseguiria pagar por mês (ex.: `"consigo pagar uns
+   300 por mês"`).
+4. Escolha uma das duas ofertas apresentadas (`"1"`, `"2"`, `"a segunda"`,
+   ...).
+5. Pronto — a renegociação é "contratada" e um protocolo é gerado.
+
+Para ver o comportamento do agente geral, abra qualquer carrinho e escreva
+algo que não seja sobre retomar a negociação (ex.: `"perdi meu emprego e
+não sei o que fazer"`) — a conversa recebe uma resposta humana e é
+encerrada, convidando o cliente a voltar quando quiser.
+
+## Aviso importante
+
+**PoneIU é um banco fictício.** Todos os dados (clientes, saldos, taxas,
+ofertas, protocolos) são gerados por uma API mock local, sem nenhuma
+chamada a sistemas bancários reais. Este projeto é educacional/demonstrativo
+— não deve ser usado como base para decisões de crédito reais sem uma
+revisão completa de compliance, segurança e regulação (Bacen, LGPD, etc.).
+
+## Licença
+
+[MIT](LICENSE).
+
+
+================================================================================
+ARQUIVO: ./requirements-dev.txt
+================================================================================
+-r requirements.txt
+pytest>=8.2.0
+
+
+================================================================================
+ARQUIVO: ./requirements.txt
+================================================================================
+streamlit>=1.38.0
+langgraph>=0.2.28
+langchain-core>=0.3.0
+langchain-anthropic>=0.2.0
+python-dotenv>=1.0.1
+pydantic>=2.7.0
+
+
+================================================================================
+ARQUIVO: ./src/agents/agente_geral.py
+================================================================================
+"""Agente geral: porteiro/orquestrador do ecossistema PoneIU.
+
+Regra de negócio central deste nó (pedida explicitamente no escopo do
+projeto): qualquer mensagem do cliente que NÃO seja um pedido para retomar
+a renegociação de dívida recebe uma resposta humana e empática, e a
+conversa é encerrada. Só quando o cliente demonstra intenção clara de
+continuar a negociação (ou está respondendo diretamente a uma pergunta do
+fluxo de renegociação, como o valor que pode pagar) é que o grafo segue
+para o `agente_renegociacao`.
+
+Ver docs/ARQUITETURA.md ("Padrão supervisor/gatekeeper") para a discussão
+de por que a validação de "resposta direta" tem prioridade sobre a
+reclassificação de intenção a cada turno.
+"""
+
+from __future__ import annotations
+
+from langchain_core.messages import AIMessage, HumanMessage
+
+from src.agents.llm import classificar_intencao, gerar_resposta_humanizada
+from src.agents.prompts import PERSONA_GERAL
+from src.agents.state import AgentState, Estagio
+from src.utils import contem_sinal_de_desistencia, extrair_escolha_oferta, extrair_valor_monetario
+
+_ESTAGIOS_VALIDOS = {estagio.value for estagio in Estagio}
+
+
+def _estagio_atual(state: AgentState) -> Estagio:
+    bruto = state.get("estagio") or Estagio.INICIO.value
+    return Estagio(bruto) if bruto in _ESTAGIOS_VALIDOS else Estagio.INICIO
+
+
+def nodo_agente_geral(state: AgentState) -> dict:
+    mensagens = state["messages"]
+    ultima_mensagem = mensagens[-1]
+    texto = ultima_mensagem.content if isinstance(ultima_mensagem, HumanMessage) else ""
+    estagio = _estagio_atual(state)
+
+    # Renegociação já concluída: não reclassifica, apenas repassa para o
+    # especialista, que sabe responder com o status final (evita duplicar
+    # a mensagem de encerramento em dois nós diferentes).
+    if estagio == Estagio.CONCLUIDO:
+        return {"estagio": estagio.value}
+
+    # Um encerramento humano anterior pode ser reaberto se o cliente agora
+    # manifestar intenção clara de retomar — por isso tratamos como um novo
+    # início de triagem, e não como um estado terminal permanente.
+    if estagio == Estagio.ENCERRADO_HUMANO:
+        estagio = Estagio.INICIO
+
+    # Se estamos no meio do fluxo aguardando um dado específico (valor em
+    # reais ou escolha de oferta) e a mensagem atual é reconhecível como
+    # essa resposta, pulamos a reclassificação de intenção: isso evita que
+    # o classificador confunda "300" ou "quero a segunda opção" com algo
+    # fora de contexto.
+    if estagio in (Estagio.AGUARDANDO_VALOR, Estagio.AGUARDANDO_ESCOLHA):
+        n_ofertas = len(state.get("ofertas_apresentadas") or [])
+        eh_resposta_direta = (
+            extrair_valor_monetario(texto) is not None
+            if estagio == Estagio.AGUARDANDO_VALOR
+            else extrair_escolha_oferta(texto, n_ofertas) is not None
+        )
+        if eh_resposta_direta:
+            return {"estagio": estagio.value}
+
+        # A mensagem não é uma resposta direta reconhecível, mas isso por si
+        # só não deve encerrar a conversa: uma resposta apenas incerta
+        # ("não sei", "sei lá") faz parte do fluxo normal e cabe ao
+        # especialista reperguntar com naturalidade. Só encerramos aqui
+        # diante de um sinal explícito de desistência/desabafo.
+        if contem_sinal_de_desistencia(texto):
+            resposta = gerar_resposta_humanizada(texto, mensagens[:-1], PERSONA_GERAL)
+            return {
+                "messages": [AIMessage(content=resposta)],
+                "estagio": Estagio.ENCERRADO_HUMANO.value,
+            }
+        return {"estagio": estagio.value}
+
+    classificacao = classificar_intencao(texto, mensagens[:-1])
+    if classificacao.intencao == "retomar_renegociacao":
+        return {"estagio": estagio.value}
+
+    resposta = gerar_resposta_humanizada(texto, mensagens[:-1], PERSONA_GERAL)
+    return {
+        "messages": [AIMessage(content=resposta)],
+        "estagio": Estagio.ENCERRADO_HUMANO.value,
+    }
+
+
+def rotear_apos_triagem(state: AgentState) -> str:
+    """Aresta condicional: decide se o grafo segue para o especialista."""
+
+    if _estagio_atual(state) == Estagio.ENCERRADO_HUMANO:
+        return "fim"
+    return "renegociacao"
+
+
+================================================================================
+ARQUIVO: ./src/agents/agente_renegociacao.py
+================================================================================
+"""Agente de renegociação de carrinho abandonado.
+
+Este agente assume a conversa quando o `agente_geral` decide que o cliente
+quer retomar uma negociação de dívida já simulada anteriormente (e não
+contratada — daí "carrinho abandonado"). Ele é uma máquina de estados
+simples com 3 passos:
+
+1. Boas-vindas + pedir quanto o cliente consegue pagar por mês.
+2. Consultar a API mock do PoneIU e apresentar as 2 ofertas mais próximas
+   do valor informado.
+3. Confirmar a escolha do cliente e "contratar" (simular) a oferta.
+
+Nenhum valor financeiro é gerado pelo LLM: todos vêm da API mock
+(`src/services/poneiu_api.py`). O LLM (quando configurado) só é usado para
+dar um verniz de naturalidade à redação — nunca para calcular ou inventar
+números.
+"""
+
+from __future__ import annotations
+
+from langchain_core.messages import AIMessage, HumanMessage
+
+from src.agents.llm import gerar_texto_livre
+from src.agents.prompts import PERSONA_RENEGOCIACAO
+from src.agents.state import AgentState, Estagio
+from src.domain.models import CarrinhoAbandonado, ConfirmacaoContrato, OfertaRenegociacao
+from src.services.poneiu_api import PoneIUBankAPI
+from src.utils import extrair_escolha_oferta, extrair_valor_monetario, format_brl
+
+_api = PoneIUBankAPI()
+
+
+def _mensagem_boas_vindas(carrinho: CarrinhoAbandonado) -> str:
+    oferta_antiga = carrinho.oferta_simulada
+    conteudo_base = (
+        f"Oi, {carrinho.cliente_nome.split()[0]}! Vi que você tinha simulado, em "
+        f"{oferta_antiga.data_simulacao}, uma renegociação do seu {carrinho.produto.rotulo} "
+        f"({carrinho.dias_em_atraso} dias em atraso, saldo de {format_brl(carrinho.saldo_devedor)}) "
+        f"em {oferta_antiga.parcelas}x de {format_brl(oferta_antiga.valor_parcela)}, mas não chegou "
+        "a fechar. Sem problema, consigo te mostrar opções novas agora mesmo. "
+        "Quanto você conseguiria pagar por mês?"
+    )
+    return gerar_texto_livre(PERSONA_RENEGOCIACAO, conteudo_base)
+
+
+def _mensagem_apresentar_ofertas(
+    carrinho: CarrinhoAbandonado, valor_pretendido: float, ofertas: list[OfertaRenegociacao]
+) -> str:
+    linhas_ofertas = "\n".join(
+        f"{i + 1}. {oferta.formatar()}" for i, oferta in enumerate(ofertas)
+    )
+    conteudo_base = (
+        f"Com base nos {format_brl(valor_pretendido)} que você disse conseguir pagar, "
+        f"encontrei estas duas opções para o seu {carrinho.produto.rotulo}:\n\n"
+        f"{linhas_ofertas}\n\n"
+        "Qual das duas fica melhor pra você? Responda 1 ou 2."
+    )
+    return gerar_texto_livre(PERSONA_RENEGOCIACAO, conteudo_base)
+
+
+def _mensagem_pedir_valor_novamente() -> str:
+    return (
+        "Não consegui identificar um valor em reais aí. Pode me dizer, mais ou menos, "
+        "quanto você consegue pagar por mês? Por exemplo: R$ 300."
+    )
+
+
+def _mensagem_pedir_escolha_novamente(n_ofertas: int) -> str:
+    opcoes = " ou ".join(str(i + 1) for i in range(n_ofertas))
+    return f"Não entendi qual opção prefere. Pode responder só com o número: {opcoes}?"
+
+
+def _mensagem_confirmacao(carrinho: CarrinhoAbandonado, confirmacao: ConfirmacaoContrato) -> str:
+    oferta = confirmacao.oferta
+    conteudo_base = (
+        f"Perfeito! Fechamos a renegociação do seu {carrinho.produto.rotulo} em "
+        f"{oferta.formatar()}. Protocolo: {confirmacao.protocolo}. A primeira parcela "
+        "vai aparecer na sua fatura/conta no próximo vencimento. Obrigado por regularizar "
+        "com o PoneIU!"
+    )
+    return gerar_texto_livre(PERSONA_RENEGOCIACAO, conteudo_base)
+
+
+def _mensagem_ja_concluido(state: AgentState) -> str:
+    protocolo = state.get("protocolo_confirmacao")
+    return (
+        f"Essa renegociação já foi concluída com sucesso (protocolo {protocolo}). "
+        "Se precisar de mais alguma coisa, é só me chamar!"
+    )
+
+
+def nodo_agente_renegociacao(state: AgentState) -> dict:
+    carrinho_bruto = state.get("carrinho")
+    if carrinho_bruto is None:
+        raise ValueError("Estado inválido: 'carrinho' não foi definido antes de iniciar o agente de renegociação.")
+    carrinho = CarrinhoAbandonado.from_dict(carrinho_bruto)
+
+    estagio_bruto = state.get("estagio") or Estagio.INICIO.value
+    estagio = Estagio(estagio_bruto) if estagio_bruto in {e.value for e in Estagio} else Estagio.INICIO
+
+    if estagio == Estagio.CONCLUIDO:
+        return {"messages": [AIMessage(content=_mensagem_ja_concluido(state))]}
+
+    ultima_mensagem = state["messages"][-1]
+    texto = ultima_mensagem.content if isinstance(ultima_mensagem, HumanMessage) else ""
+
+    if estagio in (Estagio.INICIO, Estagio.ENCERRADO_HUMANO):
+        return {
+            "messages": [AIMessage(content=_mensagem_boas_vindas(carrinho))],
+            "estagio": Estagio.AGUARDANDO_VALOR.value,
+        }
+
+    if estagio == Estagio.AGUARDANDO_VALOR:
+        valor = extrair_valor_monetario(texto)
+        if valor is None:
+            return {
+                "messages": [AIMessage(content=_mensagem_pedir_valor_novamente())],
+                "estagio": Estagio.AGUARDANDO_VALOR.value,
+            }
+
+        ofertas = _api.simular_opcoes_mais_proximas(carrinho.cart_id, valor, max_opcoes=2)
+        return {
+            "messages": [AIMessage(content=_mensagem_apresentar_ofertas(carrinho, valor, ofertas))],
+            "estagio": Estagio.AGUARDANDO_ESCOLHA.value,
+            "valor_pretendido": valor,
+            "ofertas_apresentadas": [oferta.to_dict() for oferta in ofertas],
+        }
+
+    if estagio == Estagio.AGUARDANDO_ESCOLHA:
+        ofertas_brutas = state.get("ofertas_apresentadas") or []
+        ofertas = [OfertaRenegociacao.from_dict(dado) for dado in ofertas_brutas]
+        indice = extrair_escolha_oferta(texto, len(ofertas))
+        if indice is None:
+            return {
+                "messages": [AIMessage(content=_mensagem_pedir_escolha_novamente(len(ofertas)))],
+                "estagio": Estagio.AGUARDANDO_ESCOLHA.value,
+            }
+
+        oferta_escolhida = ofertas[indice]
+        confirmacao = _api.confirmar_contratacao(carrinho.cart_id, oferta_escolhida)
+        return {
+            "messages": [AIMessage(content=_mensagem_confirmacao(carrinho, confirmacao))],
+            "estagio": Estagio.CONCLUIDO.value,
+            "oferta_escolhida": oferta_escolhida.to_dict(),
+            "protocolo_confirmacao": confirmacao.protocolo,
+        }
+
+    raise AssertionError(f"estágio inesperado no agente de renegociação: {estagio}")
+
+
+================================================================================
+ARQUIVO: ./src/agents/graph.py
+================================================================================
+"""Montagem do grafo LangGraph do ecossistema PoneIU.
+
+Topologia (ver docs/ARQUITETURA.md para o diagrama e a discussão teórica):
+
+    START -> agente_geral --(retomar_renegociacao)--> agente_renegociacao -> END
+                          \\--(outro / off-topic)-----------------------> END
+
+O `agente_geral` funciona como um supervisor/gatekeeper leve: ele decide, a
+cada turno, se a conversa segue para o especialista de renegociação ou se
+encerra com uma resposta humanizada. O checkpointer (`MemorySaver`) faz o
+grafo se comportar como um chatbot com memória de conversa por `thread_id`
+— cada carrinho abandonado usa seu próprio thread, isolando o estado de
+diferentes produtos/conversas.
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+
+from src.agents.agente_geral import nodo_agente_geral, rotear_apos_triagem
+from src.agents.agente_renegociacao import nodo_agente_renegociacao
+from src.agents.state import AgentState
+
+
+def construir_grafo():
+    builder = StateGraph(AgentState)
+
+    builder.add_node("agente_geral", nodo_agente_geral)
+    builder.add_node("agente_renegociacao", nodo_agente_renegociacao)
+
+    builder.add_edge(START, "agente_geral")
+    builder.add_conditional_edges(
+        "agente_geral",
+        rotear_apos_triagem,
+        {"renegociacao": "agente_renegociacao", "fim": END},
+    )
+    builder.add_edge("agente_renegociacao", END)
+
+    return builder.compile(checkpointer=MemorySaver())
+
+
+@lru_cache(maxsize=1)
+def obter_grafo():
+    """Compila o grafo uma única vez por processo (cache simples).
+
+    Em Streamlit isso é chamado a cada rerun do script; o `lru_cache` evita
+    recompilar e, principalmente, evita recriar o `MemorySaver` (que perderia
+    o histórico de conversas em memória a cada interação do usuário).
+    """
+
+    return construir_grafo()
+
+
+================================================================================
+ARQUIVO: ./src/agents/__init__.py
+================================================================================
+
+
+================================================================================
+ARQUIVO: ./src/agents/llm.py
+================================================================================
+"""Camada de acesso ao modelo de linguagem, com fallback determinístico.
+
+Design intencional: os NÚMEROS financeiros (parcela, taxa, total) nunca são
+gerados pelo LLM — eles vêm sempre da API mock do PoneIU (`src/services`) e
+são apenas *comunicados* pelo agente. O LLM é usado só onde há valor real em
+linguagem natural: (a) classificar a intenção do cliente e (b) redigir
+respostas humanizadas de acolhimento/encerramento. Isso elimina o risco de
+alucinação de condições de crédito — um requisito não-negociável em qualquer
+sistema bancário real.
+
+Se `ANTHROPIC_API_KEY` não estiver configurada, tudo aqui cai para um modo
+simulado 100% determinístico, para que o repositório rode "out of the box".
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Literal
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
+
+from src import config
+from src.agents.prompts import CLASSIFICACAO_INSTRUCAO
+
+IntencaoCliente = Literal["retomar_renegociacao", "outro"]
+
+_PALAVRAS_RETOMADA = (
+    "retomar",
+    "continuar",
+    "prosseguir",
+    "seguir com a negocia",
+    "seguir com a renegocia",
+    "quero renegociar",
+    "quero negociar",
+    "voltar pra negocia",
+    "voltar para negocia",
+    "quero ver as opç",
+    "quero ver as condi",
+    "bora renegociar",
+    "bora negociar",
+    "vamos renegociar",
+    "sim, quero",
+    "sim quero",
+)
+
+
+class ClassificacaoIntencao(BaseModel):
+    intencao: IntencaoCliente = Field(
+        description="'retomar_renegociacao' se o cliente pede para continuar "
+        "a negociação de dívida, 'outro' para qualquer outra coisa."
+    )
+    justificativa: str = Field(description="Uma frase curta explicando a decisão.")
+
+
+def get_chat_model():
+    """Retorna um `ChatAnthropic` configurado, ou None em modo simulado."""
+
+    if not config.LLM_DISPONIVEL:
+        return None
+
+    from langchain_anthropic import ChatAnthropic
+
+    return ChatAnthropic(
+        model=config.MODEL_NAME,
+        temperature=config.TEMPERATURE,
+        api_key=config.ANTHROPIC_API_KEY,
+    )
+
+
+def classificar_intencao(mensagem: str, historico: list[BaseMessage]) -> ClassificacaoIntencao:
+    """Classifica a última mensagem do cliente.
+
+    Usa primeiro uma heurística barata (cobre a grande maioria dos casos do
+    fluxo de demonstração); só recorre ao LLM para desambiguar quando a
+    heurística não encontra um sinal claro e há um modelo disponível.
+    """
+
+    texto = mensagem.lower()
+    if any(gatilho in texto for gatilho in _PALAVRAS_RETOMADA):
+        return ClassificacaoIntencao(
+            intencao="retomar_renegociacao",
+            justificativa="Heurística encontrou expressão de retomada explícita.",
+        )
+
+    llm = get_chat_model()
+    if llm is None:
+        return ClassificacaoIntencao(
+            intencao="outro",
+            justificativa="Modo simulado sem sinal claro de retomada; padrão conservador.",
+        )
+
+    classificador = llm.with_structured_output(ClassificacaoIntencao)
+    mensagens = [SystemMessage(content=CLASSIFICACAO_INSTRUCAO), *historico[-6:], HumanMessage(content=mensagem)]
+    resultado = classificador.invoke(mensagens)
+    assert isinstance(resultado, ClassificacaoIntencao)
+    return resultado
+
+
+_RESPOSTAS_HUMANIZADAS_FALLBACK = [
+    "Entendo, e sinto muito que esse momento esteja difícil pra você. "
+    "Fico à disposição por aqui: quando quiser retomar a negociação da sua dívida, "
+    "é só me chamar que eu já tenho as condições que você tinha simulado.",
+    "Obrigada por compartilhar isso comigo. Sei que lidar com dívidas pesa bastante no dia a dia. "
+    "Vou encerrar nossa conversa por aqui, mas assim que você quiser voltar a negociar, "
+    "é só voltar nesta tela e me chamar.",
+    "Poxa, entendo a situação. Esse canal aqui é focado em ajudar você a retomar a renegociação "
+    "que você já tinha começado. Quando fizer sentido pra você, volte que eu te mostro as opções novamente.",
+]
+
+
+def gerar_resposta_humanizada(mensagem: str, historico: list[BaseMessage], persona: str) -> str:
+    """Gera a resposta empática de encerramento do agente geral.
+
+    Em modo real, usa o LLM com a persona configurada. Em modo simulado,
+    usa uma resposta canônica variada o suficiente para não parecer um
+    script único repetido sempre igual.
+    """
+
+    llm = get_chat_model()
+    if llm is None:
+        indice = abs(hash(mensagem)) % len(_RESPOSTAS_HUMANIZADAS_FALLBACK)
+        return _RESPOSTAS_HUMANIZADAS_FALLBACK[indice]
+
+    mensagens: list[BaseMessage] = [SystemMessage(content=persona), *historico[-8:], HumanMessage(content=mensagem)]
+    resposta = llm.invoke(mensagens)
+    conteudo = resposta.content if isinstance(resposta, AIMessage) else str(resposta)
+    return str(conteudo).strip()
+
+
+def gerar_texto_livre(system_prompt: str, prompt_usuario: str, historico: list[BaseMessage] | None = None) -> str:
+    """Wrapper genérico para geração de texto livre com fallback simples.
+
+    Usado pelo agente de renegociação apenas para dar um verniz de
+    naturalidade a mensagens cujo conteúdo numérico já foi fixado
+    externamente (o prompt inclui os números exatos a serem citados).
+    """
+
+    llm = get_chat_model()
+    if llm is None:
+        return prompt_usuario
+
+    mensagens: list[BaseMessage] = [SystemMessage(content=system_prompt)]
+    if historico:
+        mensagens.extend(historico[-6:])
+    mensagens.append(HumanMessage(content=prompt_usuario))
+    resposta = llm.invoke(mensagens)
+    conteudo = resposta.content if isinstance(resposta, AIMessage) else str(resposta)
+    return str(conteudo).strip()
+
+
+def _sorteio_estavel(chave: str, opcoes: list[str]) -> str:
+    """Escolhe uma variação de texto de forma estável por chave (sem LLM)."""
+
+    rng = random.Random(chave)
+    return rng.choice(opcoes)
+
+
+================================================================================
+ARQUIVO: ./src/agents/orquestrador.py
+================================================================================
+"""Fachada usada pela interface Streamlit para conversar com o grafo.
+
+Isola a UI dos detalhes de `thread_id`, `checkpointer` e formato de estado
+do LangGraph — a camada de apresentação só conhece estas duas funções.
+"""
+
+from __future__ import annotations
+
+from langchain_core.messages import HumanMessage
+
+from src.agents.graph import obter_grafo
+from src.agents.state import AgentState, Estagio
+from src.domain.models import CarrinhoAbandonado
+
+MENSAGEM_ABERTURA = "Quero retomar minha renegociação."
+
+
+def _config(thread_id: str) -> dict:
+    return {"configurable": {"thread_id": thread_id}}
+
+
+def iniciar_conversa(carrinho: CarrinhoAbandonado) -> AgentState:
+    """Abre a "janelinha" de chat para um carrinho abandonado específico.
+
+    O clique do cliente no item da lista (na tela de soluções de dívidas)
+    já É a manifestação de intenção de retomar a renegociação — por isso a
+    primeira mensagem enviada ao grafo é sintética, equivalente a o cliente
+    ter digitado "quero retomar". Isso mantém o `agente_geral` como porta de
+    entrada única do grafo, sem precisar de um caminho especial na UI.
+
+    Idempotente: se essa thread (cart_id) já tem histórico no checkpointer —
+    por exemplo, o cliente fechou e reabriu a janelinha, ou o navegador deu
+    reload — não reenvia a saudação, só devolve o estado já existente. Sem
+    isso, cada reabertura duplicaria a mensagem de boas-vindas.
+    """
+
+    estado_existente = obter_estado(carrinho.cart_id)
+    if estado_existente and estado_existente.get("messages"):
+        return estado_existente
+
+    grafo = obter_grafo()
+    entrada: AgentState = {
+        "messages": [HumanMessage(content=MENSAGEM_ABERTURA)],
+        "estagio": Estagio.INICIO.value,
+        "carrinho": carrinho.to_dict(),
+        "valor_pretendido": None,
+        "ofertas_apresentadas": [],
+        "oferta_escolhida": None,
+        "protocolo_confirmacao": None,
+    }
+    return grafo.invoke(entrada, config=_config(carrinho.cart_id))
+
+
+def enviar_mensagem(cart_id: str, texto_cliente: str) -> AgentState:
+    """Envia uma nova mensagem do cliente para uma conversa já iniciada."""
+
+    grafo = obter_grafo()
+    entrada = {"messages": [HumanMessage(content=texto_cliente)]}
+    return grafo.invoke(entrada, config=_config(cart_id))
+
+
+def obter_estado(cart_id: str) -> AgentState | None:
+    """Recupera o estado atual (para redesenhar a UI após um rerun)."""
+
+    grafo = obter_grafo()
+    snapshot = grafo.get_state(_config(cart_id))
+    return snapshot.values if snapshot else None
+
+
+================================================================================
+ARQUIVO: ./src/agents/prompts.py
+================================================================================
+"""Prompts (system messages) usados pelos agentes do ecossistema PoneIU.
+
+Mantidos em um módulo separado para que a "personalidade" dos agentes possa
+ser ajustada/versionada sem tocar na lógica de orquestração do grafo.
+"""
+
+from __future__ import annotations
+
+PERSONA_GERAL = """\
+Você é a Aline, atendente virtual do banco PoneIU. Você é o primeiro contato \
+do cliente no canal de soluções de dívidas do app.
+
+Seu único papel aqui é: quando o cliente escreve algo que NÃO é um pedido \
+direto para retomar/continuar uma renegociação de dívida (por exemplo: um \
+desabafo pessoal sobre dificuldade financeira, uma reclamação, uma pergunta \
+sobre outro assunto, uma saudação genérica, etc.), você responde de forma \
+humana, breve, acolhedora e profissional — sem prometer nada que o banco não \
+possa cumprir, sem inventar taxas ou condições — e encerra a conversa \
+convidando o cliente a voltar quando quiser continuar a negociação.
+
+Regras importantes:
+- Nunca finja ser um humano real; você pode se apresentar como assistente \
+virtual do PoneIU se perguntado.
+- Nunca invente valores, taxas, prazos ou promessas de aprovação de crédito.
+- Se o cliente demonstrar sofrimento financeiro genuíno, valide o sentimento \
+com empatia genuína antes de encerrar (ex.: reconhecer que é um momento \
+difícil), mas não conduza uma sessão de aconselhamento financeiro completa.
+- Seja breve: 2 a 4 frases no máximo.
+- Responda sempre em português do Brasil.
+"""
+
+PERSONA_RENEGOCIACAO = """\
+Você é o Rene, especialista virtual de renegociação de dívidas do banco \
+PoneIU. Você atua exclusivamente com clientes que já haviam simulado uma \
+renegociação anteriormente e não finalizaram a contratação (carrinho \
+abandonado), e agora voltaram para retomar esse processo.
+
+Seu tom é humano, direto e sem jargão bancário excessivo. Você nunca \
+inventa valores: todos os números de parcela, taxa e prazo que você cita \
+já vêm prontos no contexto que a orquestração te fornece — sua função é \
+comunicá-los de forma clara, natural e amigável, nunca recalculá-los ou \
+alterá-los.
+
+Responda sempre em português do Brasil, em 2 a 5 frases.
+"""
+
+CLASSIFICACAO_INSTRUCAO = """\
+Você é um classificador de intenção para o canal de soluções de dívidas do \
+banco PoneIU. Dado o histórico recente da conversa e a última mensagem do \
+cliente, decida se ele está manifestando interesse em RETOMAR ou CONTINUAR \
+uma renegociação/simulação de dívida que ele já havia começado antes \
+(classifique como "retomar_renegociacao"), ou se está dizendo qualquer \
+outra coisa — desabafo pessoal, reclamação, pergunta genérica, dúvida sobre \
+outro produto, saudação, etc. (classifique como "outro").
+
+Mensagens como "quero continuar", "bora renegociar", "quero ver as opções \
+de novo", "sim, quero retomar", "vamos lá" no contexto de dívida devem ser \
+classificadas como "retomar_renegociacao". Desabafos como "não tenho como \
+pagar nada esse mês", "perdi meu emprego", "estou muito endividado e não \
+sei o que fazer" devem ser classificados como "outro", mesmo mencionando \
+dívida, pois não são um pedido direto para prosseguir com a negociação.
+"""
+
+
+================================================================================
+ARQUIVO: ./src/agents/state.py
+================================================================================
+"""Estado compartilhado do grafo LangGraph e definição dos estágios da
+conversa de renegociação.
+
+O grafo é invocado uma vez por mensagem do cliente (padrão "chatbot
+turn-by-turn" do LangGraph). O `Estagio` é o que permite que o nó do agente
+de renegociação saiba, a cada nova chamada, em qual ponto da conversa ele
+parou — sem isso, cada invocação seria "amnésica".
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+from typing import Annotated, TypedDict
+
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+
+
+class Estagio(str, Enum):
+    """Máquina de estados da conversa dentro do agente de renegociação."""
+
+    INICIO = "inicio"
+    AGUARDANDO_VALOR = "aguardando_valor"
+    AGUARDANDO_ESCOLHA = "aguardando_escolha"
+    CONCLUIDO = "concluido"
+    ENCERRADO_HUMANO = "encerrado_humano"
+
+
+class AgentState(TypedDict, total=False):
+    """Estado persistido pelo checkpointer do LangGraph (por thread_id)."""
+
+    # `add_messages` faz o merge incremental do histórico a cada invocação,
+    # em vez de sobrescrever a lista inteira — é o reducer padrão do
+    # LangGraph para conversas.
+    messages: Annotated[list[BaseMessage], add_messages]
+
+    estagio: str
+
+    # Os campos abaixo guardam dicts simples (via `.to_dict()` dos modelos em
+    # `src/domain/models.py`), nunca dataclasses/enums diretamente — o
+    # checkpointer do LangGraph serializa o estado via msgpack, então tudo
+    # que cruza essa fronteira precisa ser um tipo nativo serializável.
+    carrinho: dict | None
+    valor_pretendido: float | None
+    ofertas_apresentadas: list[dict]
+    oferta_escolhida: dict | None
+    protocolo_confirmacao: str | None
+
+
+================================================================================
+ARQUIVO: ./src/config.py
+================================================================================
+"""Configuração central do ecossistema PoneIU.
+
+Carrega variáveis de ambiente (.env) e concentra constantes de marca usadas
+tanto pelos agentes quanto pela interface Streamlit, para que a "voz" do
+banco fictício PoneIU fique consistente em todo o projeto.
+"""
+
+from __future__ import annotations
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+ANTHROPIC_API_KEY: str | None = os.getenv("ANTHROPIC_API_KEY") or None
+MODEL_NAME: str = os.getenv("PONEIU_MODEL_NAME", "claude-sonnet-5")
+TEMPERATURE: float = float(os.getenv("PONEIU_TEMPERATURE", "0.4"))
+
+# Quando não há chave de API configurada, o app cai automaticamente para o
+# modo simulado (respostas humanizadas determinísticas). Isso permite clonar
+# o repositório e rodar `streamlit run app.py` sem nenhuma credencial.
+LLM_DISPONIVEL: bool = ANTHROPIC_API_KEY is not None
+
+BANCO_NOME = "PoneIU"
+BANCO_SLOGAN = "Reorganize suas contas em dia e evite apertos"
+BANCO_PROGRAMA_DESTAQUE = "Novo Desenrola PoneIU"
+
+# Paleta inspirada em apps bancários reais, mas com identidade própria.
+COR_PRIMARIA = "#0B2A6B"      # azul-marinho PoneIU
+COR_SECUNDARIA = "#F0F2F5"    # cinza claro de fundo
+COR_DESTAQUE = "#FF7A1A"      # laranja de call-to-action / badges "Novo"
+COR_TEXTO_MUTED = "#5B6472"
+
+
+================================================================================
+ARQUIVO: ./src/domain/__init__.py
+================================================================================
+
+
+================================================================================
+ARQUIVO: ./src/domain/models.py
+================================================================================
+"""Modelos de domínio compartilhados entre a API mock e os agentes.
+
+Mantidos deliberadamente simples (dataclasses) porque este é um projeto de
+demonstração: em um banco real esses tipos viriam de um contrato de API
+(OpenAPI/protobuf) versionado entre times.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+
+from src.utils import format_brl
+
+
+class Produto(str, Enum):
+    """Produtos de crédito elegíveis para renegociação no ecossistema PoneIU."""
+
+    CARTAO = "cartao"
+    LIC = "lic"
+    PRONAMPE = "pronampe"
+
+    @property
+    def rotulo(self) -> str:
+        return {
+            Produto.CARTAO: "Cartão PoneIU",
+            Produto.LIC: "LIC PoneIU (Limite da Conta)",
+            Produto.PRONAMPE: "Pronampe PoneIU (crédito para PJ)",
+        }[self]
+
+    @property
+    def descricao_curta(self) -> str:
+        return {
+            Produto.CARTAO: "Fatura de cartão de crédito em atraso",
+            Produto.LIC: "Limite de crédito pré-aprovado vinculado à sua conta",
+            Produto.PRONAMPE: "Capital de giro para micro e pequenas empresas",
+        }[self]
+
+
+@dataclass
+class OfertaSimuladaAnteriormente:
+    """Snapshot da simulação que o cliente fez e não contratou (carrinho)."""
+
+    parcelas: int
+    taxa_mensal: float
+    valor_parcela: float
+    data_simulacao: str
+
+    def to_dict(self) -> dict:
+        return {
+            "parcelas": self.parcelas,
+            "taxa_mensal": self.taxa_mensal,
+            "valor_parcela": self.valor_parcela,
+            "data_simulacao": self.data_simulacao,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "OfertaSimuladaAnteriormente":
+        return cls(**data)
+
+
+@dataclass
+class CarrinhoAbandonado:
+    """Representa uma simulação de renegociação iniciada e não concluída."""
+
+    cart_id: str
+    cliente_nome: str
+    produto: Produto
+    saldo_devedor: float
+    dias_em_atraso: int
+    oferta_simulada: OfertaSimuladaAnteriormente
+
+    @property
+    def titulo_lista(self) -> str:
+        return self.produto.rotulo.upper()
+
+    def to_dict(self) -> dict:
+        """Representação 100% serializável (str/float/int/dict), usada como
+        fronteira antes de guardar o carrinho no estado do LangGraph — o
+        checkpointer serializa via msgpack e não deveria depender de
+        dataclasses/enums Python específicos deste projeto.
+        """
+
+        return {
+            "cart_id": self.cart_id,
+            "cliente_nome": self.cliente_nome,
+            "produto": self.produto.value,
+            "saldo_devedor": self.saldo_devedor,
+            "dias_em_atraso": self.dias_em_atraso,
+            "oferta_simulada": self.oferta_simulada.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CarrinhoAbandonado":
+        return cls(
+            cart_id=data["cart_id"],
+            cliente_nome=data["cliente_nome"],
+            produto=Produto(data["produto"]),
+            saldo_devedor=data["saldo_devedor"],
+            dias_em_atraso=data["dias_em_atraso"],
+            oferta_simulada=OfertaSimuladaAnteriormente.from_dict(data["oferta_simulada"]),
+        )
+
+
+@dataclass
+class OfertaRenegociacao:
+    """Uma opção de renegociação retornada pela API mock do PoneIU."""
+
+    id: str
+    produto: Produto
+    parcelas: int
+    taxa_mensal: float
+    valor_parcela: float
+    valor_total: float
+    desconto_percentual: float
+
+    def formatar(self) -> str:
+        taxa_pct = self.taxa_mensal * 100
+        desconto = (
+            f" (com {self.desconto_percentual:.0f}% de desconto sobre encargos)"
+            if self.desconto_percentual > 0
+            else ""
+        )
+        return (
+            f"{self.parcelas}x de {format_brl(self.valor_parcela)} "
+            f"(taxa de {taxa_pct:.2f}% a.m., total {format_brl(self.valor_total)}){desconto}"
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "produto": self.produto.value,
+            "parcelas": self.parcelas,
+            "taxa_mensal": self.taxa_mensal,
+            "valor_parcela": self.valor_parcela,
+            "valor_total": self.valor_total,
+            "desconto_percentual": self.desconto_percentual,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "OfertaRenegociacao":
+        return cls(
+            id=data["id"],
+            produto=Produto(data["produto"]),
+            parcelas=data["parcelas"],
+            taxa_mensal=data["taxa_mensal"],
+            valor_parcela=data["valor_parcela"],
+            valor_total=data["valor_total"],
+            desconto_percentual=data["desconto_percentual"],
+        )
+
+
+@dataclass
+class ConfirmacaoContrato:
+    """Retorno simulado da "contratação" de uma oferta."""
+
+    protocolo: str
+    cart_id: str
+    oferta: OfertaRenegociacao
+    status: str = "CONTRATADO"
+
+
+================================================================================
+ARQUIVO: ./src/__init__.py
+================================================================================
+
+
+================================================================================
+ARQUIVO: ./src/services/__init__.py
+================================================================================
+
+
+================================================================================
+ARQUIVO: ./src/services/poneiu_api.py
+================================================================================
+"""Mock da API core-banking do PoneIU.
+
+Em produção estas chamadas iriam para o "hub de renegociação" via HTTP/gRPC
+de um sistema de cobrança real. Aqui simulamos o mesmo contrato em memória
+para permitir rodar a demo inteira sem nenhuma dependência externa.
+
+Ver docs/ARQUITETURA.md ("Camada de dados mock") para o racional das taxas
+e prazos usados por produto.
+"""
+
+from __future__ import annotations
+
+import random
+import uuid
+from datetime import datetime, timedelta
+
+from src.domain.models import (
+    CarrinhoAbandonado,
+    ConfirmacaoContrato,
+    OfertaRenegociacao,
+    OfertaSimuladaAnteriormente,
+    Produto,
+)
+
+# Banda de taxa mensal (mín, máx) por produto. Reflete de forma simplificada
+# o perfil de risco/subsídio real de cada linha:
+# - Cartão: dívida rotativa já vencida -> taxas mais altas.
+# - LIC: limite de crédito vinculado à conta, risco intermediário.
+# - Pronampe: linha para PJ com funding subsidiado pelo governo -> taxas
+#   mais baixas e prazos mais longos (fiel ao produto real).
+_TAXAS_MENSAIS: dict[Produto, tuple[float, float]] = {
+    Produto.CARTAO: (0.0189, 0.0249),
+    Produto.LIC: (0.0129, 0.0179),
+    Produto.PRONAMPE: (0.0065, 0.0099),
+}
+
+_PRAZOS_DISPONIVEIS: dict[Produto, list[int]] = {
+    Produto.CARTAO: [3, 6, 9, 12, 18],
+    Produto.LIC: [6, 12, 18, 24, 36],
+    Produto.PRONAMPE: [12, 24, 36, 48, 60],
+}
+
+
+def _seed_carteira() -> dict[str, CarrinhoAbandonado]:
+    hoje = datetime.now()
+    return {
+        "cart-cartao-001": CarrinhoAbandonado(
+            cart_id="cart-cartao-001",
+            cliente_nome="Murilo",
+            produto=Produto.CARTAO,
+            saldo_devedor=4830.42,
+            dias_em_atraso=76,
+            oferta_simulada=OfertaSimuladaAnteriormente(
+                parcelas=12,
+                taxa_mensal=0.0229,
+                valor_parcela=498.30,
+                data_simulacao=(hoje - timedelta(days=9)).strftime("%d/%m/%Y"),
+            ),
+        ),
+        "cart-lic-001": CarrinhoAbandonado(
+            cart_id="cart-lic-001",
+            cliente_nome="Murilo",
+            produto=Produto.LIC,
+            saldo_devedor=12500.00,
+            dias_em_atraso=41,
+            oferta_simulada=OfertaSimuladaAnteriormente(
+                parcelas=24,
+                taxa_mensal=0.0159,
+                valor_parcela=698.10,
+                data_simulacao=(hoje - timedelta(days=4)).strftime("%d/%m/%Y"),
+            ),
+        ),
+        "cart-pronampe-001": CarrinhoAbandonado(
+            cart_id="cart-pronampe-001",
+            cliente_nome="Murilo Comércio ME",
+            produto=Produto.PRONAMPE,
+            saldo_devedor=38700.00,
+            dias_em_atraso=58,
+            oferta_simulada=OfertaSimuladaAnteriormente(
+                parcelas=36,
+                taxa_mensal=0.0089,
+                valor_parcela=1387.55,
+                data_simulacao=(hoje - timedelta(days=15)).strftime("%d/%m/%Y"),
+            ),
+        ),
+    }
+
+
+def _price_pmt(principal: float, taxa_mensal: float, parcelas: int) -> float:
+    """Valor de parcela pela Tabela Price (amortização francesa)."""
+
+    if taxa_mensal == 0:
+        return principal / parcelas
+    fator = (1 + taxa_mensal) ** parcelas
+    return principal * (taxa_mensal * fator) / (fator - 1)
+
+
+class PoneIUBankAPI:
+    """Cliente mock da API de renegociação de dívidas do PoneIU.
+
+    A "aleatoriedade" usa uma seed derivada do cart_id para que a demo seja
+    determinística e reprodutível entre execuções — importante para testar
+    o fluxo dos agentes sem resultados diferentes a cada vez.
+    """
+
+    def __init__(self) -> None:
+        self._carteira = _seed_carteira()
+
+    # ------------------------------------------------------------------
+    # Consulta de carrinho abandonado
+    # ------------------------------------------------------------------
+    def listar_carrinhos_abandonados(self) -> list[CarrinhoAbandonado]:
+        return list(self._carteira.values())
+
+    def obter_carrinho(self, cart_id: str) -> CarrinhoAbandonado | None:
+        return self._carteira.get(cart_id)
+
+    # ------------------------------------------------------------------
+    # Simulação de novas opções de renegociação
+    # ------------------------------------------------------------------
+    def gerar_cardapio_completo(self, cart_id: str) -> list[OfertaRenegociacao]:
+        """Gera todas as combinações de prazo disponíveis para o produto."""
+
+        carrinho = self.obter_carrinho(cart_id)
+        if carrinho is None:
+            raise ValueError(f"carrinho '{cart_id}' não encontrado")
+
+        rng = random.Random(cart_id)
+        produto = carrinho.produto
+        taxa_min, taxa_max = _TAXAS_MENSAIS[produto]
+        prazos = _PRAZOS_DISPONIVEIS[produto]
+
+        cardapio: list[OfertaRenegociacao] = []
+        for indice, parcelas in enumerate(prazos):
+            # Quanto mais parcelas, maior a taxa mensal cobrada (risco de
+            # prazo), variando suavemente dentro da banda taxa_min..taxa_max.
+            progresso = indice / max(len(prazos) - 1, 1)
+            taxa_mensal = round(taxa_min + (taxa_max - taxa_min) * progresso, 4)
+            # Desconto de encargos maior para prazos curtos (quitação rápida
+            # é incentivada, como em campanhas reais de renegociação).
+            desconto_percentual = round(max(0.0, 30 - progresso * 30), 1)
+
+            saldo_com_desconto = carrinho.saldo_devedor * (1 - desconto_percentual / 100 * 0.3)
+            valor_parcela = _price_pmt(saldo_com_desconto, taxa_mensal, parcelas)
+            valor_parcela = round(valor_parcela + rng.uniform(-1.5, 1.5), 2)
+            valor_total = round(valor_parcela * parcelas, 2)
+
+            cardapio.append(
+                OfertaRenegociacao(
+                    id=f"{cart_id}-{parcelas}x",
+                    produto=produto,
+                    parcelas=parcelas,
+                    taxa_mensal=taxa_mensal,
+                    valor_parcela=valor_parcela,
+                    valor_total=valor_total,
+                    desconto_percentual=desconto_percentual,
+                )
+            )
+        return cardapio
+
+    def simular_opcoes_mais_proximas(
+        self,
+        cart_id: str,
+        valor_pretendido: float,
+        max_opcoes: int = 2,
+    ) -> list[OfertaRenegociacao]:
+        """Devolve as `max_opcoes` ofertas cuja parcela mensal fica mais
+        próxima do valor que o cliente disse conseguir pagar.
+        """
+
+        cardapio = self.gerar_cardapio_completo(cart_id)
+        cardapio_ordenado = sorted(
+            cardapio, key=lambda oferta: abs(oferta.valor_parcela - valor_pretendido)
+        )
+        return cardapio_ordenado[:max_opcoes]
+
+    # ------------------------------------------------------------------
+    # Confirmação (contratação simulada)
+    # ------------------------------------------------------------------
+    def confirmar_contratacao(self, cart_id: str, oferta: OfertaRenegociacao) -> ConfirmacaoContrato:
+        protocolo = f"PONEIU-{uuid.uuid4().hex[:10].upper()}"
+        return ConfirmacaoContrato(protocolo=protocolo, cart_id=cart_id, oferta=oferta)
+
+
+================================================================================
+ARQUIVO: ./src/ui/components.py
+================================================================================
+"""Componentes visuais da tela "Solução de dívidas" do PoneIU.
+
+Reproduz a estrutura da referência de design fornecida (tela real de um
+banco): barra superior, selo + título, card de destaque ("Desenrola") e a
+seção "Formas de reorganizar" com a lista de carrinhos abandonados que o
+cliente pode retomar.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+import streamlit as st
+from langchain_core.messages import AIMessage
+
+from src.agents import orquestrador
+from src.agents.state import Estagio
+from src.config import BANCO_NOME, BANCO_PROGRAMA_DESTAQUE, BANCO_SLOGAN
+from src.domain.models import CarrinhoAbandonado, OfertaRenegociacao, Produto
+from src.utils import format_brl, formatar_data_relativa
+
+_ICONE_PRODUTO = {
+    Produto.CARTAO: "💳",
+    Produto.LIC: "💵",
+    Produto.PRONAMPE: "🏢",
+}
+
+_PASSOS_RENEGOCIACAO = ["Valor mensal", "Escolher oferta", "Confirmação"]
+
+
+def render_header() -> None:
+    # Continua em HTML puro (sem st.columns): o `block-container` deste app é
+    # deliberadamente estreito (tela de celular) e o layout de colunas nativo
+    # do Streamlit empilha verticalmente abaixo de ~640px de viewport — o que
+    # quebraria a barra superior em 3 linhas em vez de 1. A ajuda interativa
+    # mora em `render_ajuda()`, um expander de largura total (imune a esse
+    # problema).
+    st.markdown(
+        """
+        <div class="poneiu-topbar">
+            <span title="Voltar">‹</span>
+            <span style="font-weight:700; font-size:1rem; letter-spacing:0.04em;">PONEIU</span>
+            <span title="Ajuda">❓</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_hero(carrinhos: list[CarrinhoAbandonado] | None = None) -> None:
+    primeiro_nome = carrinhos[0].cliente_nome.split()[0] if carrinhos else None
+    saudacao = f'<div class="poneiu-greeting">Olá, {primeiro_nome} 👋</div>' if primeiro_nome else ""
+    st.markdown(
+        f"""
+        <div style="font-size:2.2rem;">🤝</div>
+        {saudacao}
+        <div class="poneiu-eyebrow">Solução de dívidas</div>
+        <div class="poneiu-hero-title">{BANCO_SLOGAN}</div>
+        <div class="poneiu-trust-row">
+            <span>🔒 Ambiente seguro</span>
+            <span>📵 Não afeta seu score</span>
+            <span>⚡ Simulação em segundos</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_ajuda() -> None:
+    with st.expander("❓ Central de ajuda"):
+        st.markdown(
+            "- **Como funciona?** Toque em uma simulação não finalizada e continue de onde parou.\n"
+            "- **Preciso pagar algo agora?** Não — aqui você só simula e confirma novas condições.\n"
+            "- **Meus dados estão seguros?** Sim, o ambiente é protegido e nada é compartilhado "
+            "com terceiros.\n"
+            "- **Não estou conseguindo pagar nada.** Conte para o assistente — ele vai te ouvir "
+            "com empatia."
+        )
+
+
+def render_resumo(carrinhos: list[CarrinhoAbandonado], maior_desconto_percentual: float) -> None:
+    if not carrinhos:
+        return
+
+    total_pendente = sum(carrinho.saldo_devedor for carrinho in carrinhos)
+    rotulo_qtd = "simulação" if len(carrinhos) == 1 else "simulações"
+
+    st.markdown(
+        f"""
+        <div class="poneiu-stat-row">
+            <div class="poneiu-stat-tile">
+                <div class="poneiu-stat-value">{format_brl(total_pendente)}</div>
+                <div class="poneiu-stat-label">Total em pendências</div>
+            </div>
+            <div class="poneiu-stat-tile">
+                <div class="poneiu-stat-value">{len(carrinhos)}</div>
+                <div class="poneiu-stat-label">{rotulo_qtd} em aberto</div>
+            </div>
+            <div class="poneiu-stat-tile poneiu-stat-tile-destaque">
+                <div class="poneiu-stat-value">até {maior_desconto_percentual:.0f}%</div>
+                <div class="poneiu-stat-label">de desconto disponível</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_desenrola_card() -> None:
+    with st.container(border=True):
+        st.markdown(
+            f"""
+            <div style="display:flex; align-items:center; gap:0.9rem;">
+                <div style="font-size:1.8rem;">🟢</div>
+                <div>
+                    <div class="poneiu-card-title">{BANCO_PROGRAMA_DESTAQUE}</div>
+                    <div class="poneiu-card-desc">Entenda como funciona e quem pode participar.</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        with st.expander("Saiba mais"):
+            st.markdown(
+                "- Redução dos juros e encargos acumulados na dívida em atraso.\n"
+                "- Parcelamento facilitado, sem burocracia e sem sair do app.\n"
+                "- Sua simulação fica salva mesmo se você sair no meio — é só voltar aqui.\n"
+                "- Atendimento humano disponível caso você prefira conversar com uma pessoa."
+            )
+    st.markdown("<div style='height: 1.4rem;'></div>", unsafe_allow_html=True)
+
+
+def _chip_urgencia(dias_em_atraso: int) -> str:
+    if dias_em_atraso > 60:
+        classe, icone, rotulo = "critico", "🔴", "Crítico"
+    elif dias_em_atraso > 30:
+        classe, icone, rotulo = "urgente", "🟠", "Urgente"
+    else:
+        classe, icone, rotulo = "atencao", "🟡", "Atenção"
+    return f'<span class="poneiu-chip poneiu-chip-{classe}">{icone} {rotulo}</span>'
+
+
+def render_formas_reorganizar(carrinhos: list[CarrinhoAbandonado]) -> None:
+    st.markdown('<div class="poneiu-section-title">Formas de reorganizar</div>', unsafe_allow_html=True)
+
+    with st.container(border=True):
+        st.markdown(
+            """
+            <span class="poneiu-badge-novo">Novo</span>
+            <div class="poneiu-card-title">Parcelar faturas</div>
+            <div class="poneiu-card-desc">
+                Antecipe ou parcele as faturas do seu cartão e tenha um alívio no mês.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("<div style='height: 0.6rem;'></div>", unsafe_allow_html=True)
+
+        for indice, carrinho in enumerate(carrinhos):
+            if indice > 0:
+                st.markdown('<div class="poneiu-divider"></div>', unsafe_allow_html=True)
+
+            icone = _ICONE_PRODUTO.get(carrinho.produto, "📄")
+            rotulo = f"{icone}  {carrinho.titulo_lista}"
+            col_botao, col_chip = st.columns([3, 1])
+            with col_botao:
+                if st.button(rotulo, key=f"abrir_chat_{carrinho.cart_id}", use_container_width=True):
+                    st.session_state["carrinho_ativo_id"] = carrinho.cart_id
+            with col_chip:
+                st.markdown(
+                    f'<div class="poneiu-chip-cell">{_chip_urgencia(carrinho.dias_em_atraso)}</div>',
+                    unsafe_allow_html=True,
+                )
+            data_relativa = formatar_data_relativa(carrinho.oferta_simulada.data_simulacao)
+            st.caption(
+                f"Simulado em {carrinho.oferta_simulada.data_simulacao} ({data_relativa}) · "
+                f"saldo de {format_brl(carrinho.saldo_devedor)} · "
+                f"{carrinho.dias_em_atraso} dias em atraso — não finalizado"
+            )
+
+
+def render_footer() -> None:
+    st.markdown(
+        '<div class="poneiu-footer-trust">🔒 Seus dados estão protegidos · Simulação sem compromisso '
+        "e sem consulta que afeta seu score</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _renderizar_historico(mensagens: list) -> None:
+    for mensagem in mensagens:
+        eh_ia = isinstance(mensagem, AIMessage)
+        # A mensagem sintética de abertura ("Quero retomar minha renegociação.")
+        # é um artifício de orquestração (ver src/agents/orquestrador.py) e não
+        # deve aparecer como se o cliente a tivesse digitado.
+        if not eh_ia and mensagem.content == orquestrador.MENSAGEM_ABERTURA:
+            continue
+        papel = "assistant" if eh_ia else "user"
+        avatar = "🏦" if eh_ia else "🧑"
+        with st.chat_message(papel, avatar=avatar):
+            # Escapa "$" antes de renderizar: o Markdown do Streamlit trata
+            # pares de "$" como delimitadores de LaTeX, e nossas mensagens
+            # citam valores em reais ("R$ 1.234,56") repetidas vezes — sem o
+            # escape, o trecho entre dois "R$" vira uma fórmula quebrada.
+            st.write(str(mensagem.content).replace("$", "\\$"))
+
+
+def _passo_atual(estagio: str | None) -> int:
+    if estagio == Estagio.AGUARDANDO_ESCOLHA.value:
+        return 2
+    if estagio == Estagio.CONCLUIDO.value:
+        return 3
+    return 1
+
+
+def _renderizar_stepper(estagio: str | None) -> None:
+    """Mostra em que ponto do fluxo (valor → oferta → confirmação) a
+    conversa está. Escondido quando o gatekeeper encerrou a conversa, já
+    que o banner de encerramento conta essa história melhor do que um
+    stepper "parado no meio".
+    """
+
+    if estagio == Estagio.ENCERRADO_HUMANO.value:
+        return
+
+    passo_atual = _passo_atual(estagio)
+    itens = []
+    for indice, nome in enumerate(_PASSOS_RENEGOCIACAO, start=1):
+        if indice < passo_atual:
+            estado_css, marcador = "done", "✓"
+        elif indice == passo_atual:
+            estado_css, marcador = "active", str(indice)
+        else:
+            estado_css, marcador = "pending", str(indice)
+        itens.append(
+            f'<div class="poneiu-step poneiu-step-{estado_css}">'
+            f'<div class="poneiu-step-circle">{marcador}</div>'
+            f'<div class="poneiu-step-label">{nome}</div>'
+            "</div>"
+        )
+    st.markdown(f'<div class="poneiu-stepper">{"".join(itens)}</div>', unsafe_allow_html=True)
+
+
+def _sugestoes_valor(carrinho: CarrinhoAbandonado) -> list[int]:
+    """Sugere 3 valores mensais próximos da parcela que o cliente já tinha
+    simulado antes, para permitir responder com um toque em vez de digitar.
+    """
+
+    base = carrinho.oferta_simulada.valor_parcela
+    valores = {max(round(base * fator / 50) * 50, 50) for fator in (0.7, 1.0, 1.3)}
+    return sorted(valores)
+
+
+def _renderizar_sugestoes_valor(carrinho: CarrinhoAbandonado) -> None:
+    valores = _sugestoes_valor(carrinho)
+    st.markdown(
+        '<div class="poneiu-muted" style="margin: 0.2rem 0 0.4rem;">Ou toque em um valor:</div>',
+        unsafe_allow_html=True,
+    )
+    colunas = st.columns(len(valores))
+    for coluna, valor in zip(colunas, valores):
+        with coluna:
+            with st.container(border=True):
+                if st.button(
+                    format_brl(valor),
+                    key=f"valor_sugerido_{carrinho.cart_id}_{valor}",
+                    use_container_width=True,
+                ):
+                    with st.spinner("Calculando as melhores opções..."):
+                        orquestrador.enviar_mensagem(carrinho.cart_id, f"consigo pagar {valor} reais por mês")
+                    st.rerun()
+
+
+def _renderizar_ofertas_selecionaveis(cart_id: str, ofertas_brutas: list[dict]) -> None:
+    """Cartões de oferta clicáveis, alternativa ao cliente digitar "1"/"2"."""
+
+    if not ofertas_brutas:
+        return
+
+    ofertas = [OfertaRenegociacao.from_dict(dado) for dado in ofertas_brutas]
+    indice_melhor = max(range(len(ofertas)), key=lambda i: ofertas[i].desconto_percentual)
+
+    st.markdown(
+        '<div class="poneiu-muted" style="margin: 0.2rem 0 0.4rem;">Ou escolha uma opção:</div>',
+        unsafe_allow_html=True,
+    )
+    for indice, oferta in enumerate(ofertas):
+        with st.container(border=True):
+            if indice == indice_melhor and oferta.desconto_percentual > 0:
+                st.markdown('<span class="poneiu-offer-badge">⭐ Melhor custo-benefício</span>', unsafe_allow_html=True)
+            taxa_pct = oferta.taxa_mensal * 100
+            detalhe_desconto = (
+                f'<div class="poneiu-offer-detail" style="color:#12602F;">'
+                f"💸 {oferta.desconto_percentual:.0f}% de desconto sobre encargos</div>"
+                if oferta.desconto_percentual > 0
+                else ""
+            )
+            st.markdown(
+                f"""
+                <div class="poneiu-offer-parcela">{oferta.parcelas}x de {format_brl(oferta.valor_parcela)}</div>
+                <div class="poneiu-offer-detail">taxa {taxa_pct:.2f}% a.m. · total {format_brl(oferta.valor_total)}</div>
+                {detalhe_desconto}
+                """,
+                unsafe_allow_html=True,
+            )
+            st.markdown("<div style='height: 0.5rem;'></div>", unsafe_allow_html=True)
+            if st.button("Escolher esta opção", key=f"escolher_{cart_id}_{indice}", use_container_width=True):
+                with st.spinner("Confirmando sua escolha..."):
+                    orquestrador.enviar_mensagem(cart_id, f"quero a opção {indice + 1}")
+                st.rerun()
+
+
+def _texto_comprovante(carrinho: CarrinhoAbandonado, oferta: OfertaRenegociacao, protocolo: str) -> str:
+    agora = datetime.now().strftime("%d/%m/%Y %H:%M")
+    taxa_pct = oferta.taxa_mensal * 100
+    return (
+        "COMPROVANTE DE RENEGOCIAÇÃO — PONEIU\n"
+        f"Emitido em: {agora}\n"
+        f"Protocolo: {protocolo}\n\n"
+        f"Cliente: {carrinho.cliente_nome}\n"
+        f"Produto: {carrinho.produto.rotulo}\n"
+        f"Saldo devedor original: {format_brl(carrinho.saldo_devedor)}\n\n"
+        f"Condição contratada: {oferta.parcelas}x de {format_brl(oferta.valor_parcela)}\n"
+        f"Taxa: {taxa_pct:.2f}% a.m.\n"
+        f"Valor total: {format_brl(oferta.valor_total)}\n"
+        f"Desconto aplicado: {oferta.desconto_percentual:.0f}%\n\n"
+        "PoneIU é um banco fictício criado para fins de demonstração.\n"
+        "Este comprovante não possui validade financeira real."
+    )
+
+
+def _renderizar_confirmacao(carrinho: CarrinhoAbandonado, estado: dict) -> None:
+    protocolo = estado.get("protocolo_confirmacao")
+    oferta_bruta = estado.get("oferta_escolhida")
+    if not protocolo or not oferta_bruta:
+        return
+
+    oferta = OfertaRenegociacao.from_dict(oferta_bruta)
+    taxa_pct = oferta.taxa_mensal * 100
+
+    chave_balao = f"balao_exibido_{carrinho.cart_id}"
+    if not st.session_state.get(chave_balao):
+        st.balloons()
+        st.session_state[chave_balao] = True
+
+    st.markdown(
+        f"""
+        <div class="poneiu-receipt">
+            <div class="poneiu-receipt-titulo">✅ Renegociação concluída</div>
+            <div class="poneiu-receipt-row"><span>Produto</span><span>{carrinho.produto.rotulo}</span></div>
+            <div class="poneiu-receipt-row"><span>Condição</span><span>{oferta.parcelas}x de {format_brl(oferta.valor_parcela)}</span></div>
+            <div class="poneiu-receipt-row"><span>Taxa</span><span>{taxa_pct:.2f}% a.m.</span></div>
+            <div class="poneiu-receipt-row"><span>Total</span><span>{format_brl(oferta.valor_total)}</span></div>
+            <div class="poneiu-receipt-row"><span>Protocolo</span><span>{protocolo}</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.download_button(
+        "⬇️ Baixar comprovante",
+        data=_texto_comprovante(carrinho, oferta, protocolo),
+        file_name=f"comprovante_{protocolo}.txt",
+        use_container_width=True,
+        key=f"download_{carrinho.cart_id}",
+    )
+
+
+def abrir_chat_dialog(carrinho: CarrinhoAbandonado) -> None:
+    """Abre a "janelinha" conversacional ligada ao agente de renegociação.
+
+    Usa `st.session_state` para decidir se a conversa deste `cart_id` já foi
+    iniciada no grafo (e, portanto, só precisamos ler o estado já
+    persistido pelo checkpointer) ou se precisamos chamar
+    `orquestrador.iniciar_conversa` pela primeira vez.
+    """
+
+    chave_iniciado = f"conversa_iniciada_{carrinho.cart_id}"
+
+    @st.dialog(f"💬 Assistente {BANCO_NOME} · {carrinho.produto.rotulo}", width="large")
+    def _dialog() -> None:
+        if not st.session_state.get(chave_iniciado):
+            orquestrador.iniciar_conversa(carrinho)
+            st.session_state[chave_iniciado] = True
+
+        estado = orquestrador.obter_estado(carrinho.cart_id) or {}
+        mensagens = estado.get("messages", [])
+        estagio = estado.get("estagio")
+
+        _renderizar_stepper(estagio)
+
+        with st.container(height=380):
+            _renderizar_historico(mensagens)
+
+        if estagio == Estagio.AGUARDANDO_VALOR.value:
+            _renderizar_sugestoes_valor(carrinho)
+        elif estagio == Estagio.AGUARDANDO_ESCOLHA.value:
+            _renderizar_ofertas_selecionaveis(carrinho.cart_id, estado.get("ofertas_apresentadas") or [])
+        elif estagio == Estagio.ENCERRADO_HUMANO.value:
+            st.markdown(
+                '<div class="poneiu-encerrado-banner">⏸️ Conversa encerrada pelo assistente. '
+                "Digite novamente ou toque no botão abaixo se quiser retomar a renegociação.</div>",
+                unsafe_allow_html=True,
+            )
+            if st.button(
+                "🔄 Quero retomar a negociação", use_container_width=True, key=f"retomar_{carrinho.cart_id}"
+            ):
+                with st.spinner("Retomando sua negociação..."):
+                    orquestrador.enviar_mensagem(carrinho.cart_id, "quero retomar a negociação")
+                st.rerun()
+        elif estagio == Estagio.CONCLUIDO.value:
+            _renderizar_confirmacao(carrinho, estado)
+
+        texto = st.chat_input("Digite sua mensagem para o PoneIU...")
+        if texto:
+            with st.spinner("Assistente PoneIU está respondendo..."):
+                orquestrador.enviar_mensagem(carrinho.cart_id, texto)
+            st.rerun()
+
+        if st.button("Fechar conversa", use_container_width=True, key=f"fechar_{carrinho.cart_id}"):
+            st.session_state["carrinho_ativo_id"] = None
+            st.session_state.pop(chave_iniciado, None)
+            st.session_state.pop(f"balao_exibido_{carrinho.cart_id}", None)
+            st.rerun()
+
+    _dialog()
+
+
+================================================================================
+ARQUIVO: ./src/ui/__init__.py
+================================================================================
+
+
+================================================================================
+ARQUIVO: ./src/ui/styles.py
+================================================================================
+"""CSS injetado na aplicação Streamlit para simular um app bancário real.
+
+A ideia é reduzir a "cara de Streamlit" (esconder o menu padrão, limitar a
+largura como uma tela de celular, transformar `st.button` em linhas de
+lista com chevron) para que o layout fique próximo da referência de design
+(a tela de "Solução de dívidas" fornecida pelo usuário).
+"""
+
+from __future__ import annotations
+
+from src.config import COR_DESTAQUE, COR_PRIMARIA, COR_SECUNDARIA, COR_TEXTO_MUTED
+
+CSS = f"""
+<style>
+#MainMenu {{visibility: hidden;}}
+footer {{visibility: hidden;}}
+
+.stApp {{
+    background: {COR_SECUNDARIA};
+}}
+
+.block-container {{
+    max-width: 460px;
+    margin: 0 auto;
+    padding-top: 1.2rem;
+    padding-bottom: 3rem;
+    background: #FFFFFF;
+    min-height: 100vh;
+    box-shadow: 0 0 40px rgba(20, 30, 60, 0.08);
+}}
+
+/* ---- topo: voltar / ajuda ---- */
+.poneiu-topbar {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 1.4rem;
+    color: {COR_PRIMARIA};
+    margin-bottom: 0.5rem;
+}}
+
+/* ---- selo "Solução de dívidas" + título ---- */
+.poneiu-eyebrow {{
+    color: {COR_TEXTO_MUTED};
+    font-size: 0.95rem;
+    margin-top: 0.75rem;
+    margin-bottom: 0.15rem;
+}}
+
+.poneiu-hero-title {{
+    font-size: 1.85rem;
+    font-weight: 800;
+    line-height: 1.25;
+    color: #10152B;
+    margin-bottom: 1.1rem;
+}}
+
+.poneiu-section-title {{
+    font-size: 1.55rem;
+    font-weight: 700;
+    color: #10152B;
+    margin: 1.6rem 0 0.9rem 0;
+}}
+
+.poneiu-badge-novo {{
+    display: inline-block;
+    background: {COR_PRIMARIA};
+    color: white;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    padding: 3px 10px;
+    border-radius: 999px;
+    float: right;
+}}
+
+.poneiu-card-title {{
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: #10152B;
+    margin-bottom: 0.25rem;
+}}
+
+.poneiu-card-desc {{
+    color: {COR_TEXTO_MUTED};
+    font-size: 0.92rem;
+    line-height: 1.4;
+}}
+
+.poneiu-muted {{
+    color: {COR_TEXTO_MUTED};
+    font-size: 0.85rem;
+}}
+
+/* ---- cards com borda nativa do Streamlit (st.container(border=True)) ---- */
+div[data-testid="stVerticalBlockBorderWrapper"] {{
+    border-radius: 18px !important;
+    border: 1px solid #E7EAEF !important;
+    box-shadow: 0 6px 18px rgba(16, 21, 43, 0.06);
+}}
+
+/* ---- botões de lista (linhas clicáveis, ex.: produtos do carrinho) ---- */
+div[data-testid="stButton"] button {{
+    width: 100%;
+    text-align: left !important;
+    justify-content: flex-start !important;
+    background: transparent;
+    border: none;
+    border-radius: 10px;
+    padding: 0.85rem 1.6rem 0.85rem 0.6rem;
+    color: #10152B;
+    font-weight: 600;
+    position: relative;
+}}
+div[data-testid="stButton"] button:hover {{
+    background: #F3F5F8;
+    color: {COR_PRIMARIA};
+    border: none;
+}}
+div[data-testid="stButton"] button p {{
+    font-size: 0.95rem;
+}}
+div[data-testid="stButton"] button::after {{
+    content: "\\203A";
+    position: absolute;
+    right: 0.6rem;
+    top: 50%;
+    transform: translateY(-50%);
+    color: #9AA1AC;
+    font-size: 1.3rem;
+    font-weight: 400;
+}}
+
+.poneiu-divider {{
+    border-top: 1px solid #EEF0F3;
+    margin: 0.1rem 0;
+}}
+
+.poneiu-chat-role-banco {{
+    font-weight: 700;
+    color: {COR_PRIMARIA};
+}}
+
+.poneiu-encerrado-banner {{
+    background: #FFF4E9;
+    border: 1px solid {COR_DESTAQUE};
+    color: #7A3E00;
+    padding: 0.6rem 0.9rem;
+    border-radius: 10px;
+    font-size: 0.85rem;
+    margin-top: 0.5rem;
+}}
+
+/* ---- colunas nativas do Streamlit usadas em alguns trechos (linha do
+   carrinho, sugestões de valor): alinha verticalmente quando renderizadas
+   lado a lado (telas largas o suficiente para não empilhar) ---- */
+div[data-testid="stHorizontalBlock"] {{
+    align-items: center;
+}}
+
+/* ---- saudação + selo de confiança no hero ---- */
+.poneiu-greeting {{
+    color: {COR_TEXTO_MUTED};
+    font-size: 0.95rem;
+    margin-top: 0.9rem;
+}}
+
+.poneiu-trust-row {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.9rem;
+    color: {COR_TEXTO_MUTED};
+    font-size: 0.78rem;
+    margin: -0.4rem 0 1.3rem 0;
+}}
+
+/* ---- resumo (stat tiles) ---- */
+.poneiu-stat-row {{
+    display: flex;
+    gap: 0.7rem;
+    margin-bottom: 1.4rem;
+}}
+
+.poneiu-stat-tile {{
+    flex: 1;
+    background: {COR_SECUNDARIA};
+    border-radius: 14px;
+    padding: 0.75rem 0.6rem;
+    text-align: center;
+}}
+
+.poneiu-stat-tile-destaque {{
+    background: #FFF4E9;
+}}
+
+.poneiu-stat-value {{
+    font-size: 1.15rem;
+    font-weight: 800;
+    color: #10152B;
+    line-height: 1.2;
+}}
+
+.poneiu-stat-tile-destaque .poneiu-stat-value {{
+    color: {COR_DESTAQUE};
+}}
+
+.poneiu-stat-label {{
+    font-size: 0.72rem;
+    color: {COR_TEXTO_MUTED};
+    margin-top: 0.15rem;
+    line-height: 1.25;
+}}
+
+/* ---- expander "saiba mais" com a mesma linguagem visual dos cards ---- */
+div[data-testid="stExpander"] {{
+    border-radius: 14px !important;
+    border: 1px solid #E7EAEF !important;
+}}
+div[data-testid="stExpander"] summary {{
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: {COR_PRIMARIA};
+}}
+
+/* ---- chips de urgência na lista de carrinhos ---- */
+.poneiu-chip-cell {{
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    height: 100%;
+    min-height: 2.6rem;
+}}
+
+.poneiu-chip {{
+    display: inline-block;
+    white-space: nowrap;
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 3px 8px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+}}
+
+.poneiu-chip-critico {{
+    background: #FDECEC;
+    border-color: #D03B3B;
+    color: #8A2323;
+}}
+
+.poneiu-chip-urgente {{
+    background: #FFF4E9;
+    border-color: {COR_DESTAQUE};
+    color: #7A3E00;
+}}
+
+.poneiu-chip-atencao {{
+    background: #FFF9E6;
+    border-color: #EDA100;
+    color: #7A5C00;
+}}
+
+/* ---- stepper de progresso dentro do chat ---- */
+.poneiu-stepper {{
+    display: flex;
+    margin: 0.2rem 0 0.9rem 0;
+}}
+
+.poneiu-step {{
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    position: relative;
+}}
+
+.poneiu-step::before {{
+    content: "";
+    position: absolute;
+    top: 0.75rem;
+    left: -50%;
+    width: 100%;
+    height: 2px;
+    background: #E7EAEF;
+    z-index: 0;
+}}
+
+.poneiu-step:first-child::before {{
+    content: none;
+}}
+
+.poneiu-step-done::before {{
+    background: {COR_PRIMARIA};
+}}
+
+.poneiu-step-circle {{
+    position: relative;
+    z-index: 1;
+    width: 1.5rem;
+    height: 1.5rem;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    font-weight: 700;
+    background: #E7EAEF;
+    color: {COR_TEXTO_MUTED};
+}}
+
+.poneiu-step-done .poneiu-step-circle {{
+    background: {COR_PRIMARIA};
+    color: white;
+}}
+
+.poneiu-step-active .poneiu-step-circle {{
+    background: white;
+    color: {COR_PRIMARIA};
+    border: 2px solid {COR_PRIMARIA};
+}}
+
+.poneiu-step-label {{
+    font-size: 0.68rem;
+    color: {COR_TEXTO_MUTED};
+    margin-top: 0.3rem;
+    line-height: 1.2;
+}}
+
+.poneiu-step-active .poneiu-step-label, .poneiu-step-done .poneiu-step-label {{
+    color: #10152B;
+    font-weight: 600;
+}}
+
+/* ---- cartões de oferta selecionáveis no chat ---- */
+.poneiu-offer-badge {{
+    display: inline-block;
+    background: {COR_DESTAQUE};
+    color: white;
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 2px 9px;
+    border-radius: 999px;
+    margin-bottom: 0.4rem;
+}}
+
+.poneiu-offer-parcela {{
+    font-size: 1.05rem;
+    font-weight: 800;
+    color: #10152B;
+}}
+
+.poneiu-offer-detail {{
+    font-size: 0.82rem;
+    color: {COR_TEXTO_MUTED};
+    margin-top: 0.1rem;
+}}
+
+/* ---- comprovante de confirmação ---- */
+.poneiu-receipt {{
+    background: #E9F7EF;
+    border: 1px solid #1F9D55;
+    border-radius: 14px;
+    padding: 0.9rem 1rem;
+    margin-top: 0.5rem;
+}}
+
+.poneiu-receipt-titulo {{
+    font-weight: 700;
+    color: #12602F;
+    margin-bottom: 0.5rem;
+    font-size: 0.95rem;
+}}
+
+.poneiu-receipt-row {{
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.83rem;
+    color: #12602F;
+    padding: 0.18rem 0;
+    border-top: 1px solid rgba(31, 157, 85, 0.2);
+}}
+
+.poneiu-receipt-row:first-of-type {{
+    border-top: none;
+}}
+
+.poneiu-receipt-row span:first-child {{
+    color: #3B6E52;
+}}
+
+.poneiu-receipt-row span:last-child {{
+    font-weight: 700;
+}}
+
+/* ---- rodapé de confiança ---- */
+.poneiu-footer-trust {{
+    text-align: center;
+    color: {COR_TEXTO_MUTED};
+    font-size: 0.72rem;
+    margin-top: 2rem;
+    padding-top: 1rem;
+    border-top: 1px solid #EEF0F3;
+}}
+</style>
+"""
+
+
+================================================================================
+ARQUIVO: ./src/utils.py
+================================================================================
+"""Pequenos utilitários compartilhados entre domínio, agentes e UI."""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime
+
+
+def format_brl(valor: float) -> str:
+    """Formata um float como moeda brasileira: 1234.5 -> "R$ 1.234,50"."""
+
+    texto = f"{valor:,.2f}"
+    texto = texto.replace(",", "#").replace(".", ",").replace("#", ".")
+    return f"R$ {texto}"
+
+
+def formatar_data_relativa(data_str: str, referencia: datetime | None = None) -> str:
+    """Converte "dd/mm/aaaa" em um texto relativo curto ("hoje", "ontem", "há N dias").
+
+    Usado na lista de carrinhos abandonados para reforçar o senso de tempo
+    sem esconder a data exata (que continua exibida ao lado).
+    """
+
+    referencia = referencia or datetime.now()
+    data = datetime.strptime(data_str, "%d/%m/%Y")
+    dias = (referencia.date() - data.date()).days
+    if dias <= 0:
+        return "hoje"
+    if dias == 1:
+        return "ontem"
+    return f"há {dias} dias"
+
+
+_VALOR_REGEX = re.compile(
+    r"(?:r\$\s*)?(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)",
+    re.IGNORECASE,
+)
+
+
+def extrair_valor_monetario(texto: str) -> float | None:
+    """Tenta extrair um valor em reais de uma frase livre do cliente.
+
+    Aceita formatos como "300", "R$ 300,00", "mil e duzentos", "1.200,50".
+    Não tenta ser um parser de linguagem natural completo — é um extrator
+    pragmático o suficiente para o fluxo de coleta de valor no chat.
+    """
+
+    texto_normalizado = texto.strip().lower()
+    if not texto_normalizado:
+        return None
+
+    match = _VALOR_REGEX.search(texto_normalizado)
+    if not match:
+        return None
+
+    bruto = match.group(1)
+    if "," in bruto:
+        bruto = bruto.replace(".", "").replace(",", ".")
+    else:
+        # "1.200" (separador de milhar) vs "12.50" (decimal) — se houver mais
+        # de 3 dígitos após o ponto ou mais de um ponto, trata como milhar.
+        partes = bruto.split(".")
+        if len(partes) > 1 and len(partes[-1]) == 3:
+            bruto = bruto.replace(".", "")
+
+    try:
+        valor = float(bruto)
+    except ValueError:
+        return None
+
+    return valor if valor > 0 else None
+
+
+_SINAIS_DE_DESISTENCIA_MEIO_FLUXO = (
+    "perdi o emprego",
+    "perdi meu emprego",
+    "desemprega",
+    "fui demitid",
+    "não aguento",
+    "nao aguento",
+    "sem dinheiro nenhum",
+    "não tenho como pagar nada",
+    "nao tenho como pagar nada",
+    "não consigo pagar nada",
+    "nao consigo pagar nada",
+    "não sei o que fazer da vida",
+    "nao sei o que fazer da vida",
+    "quero cancelar",
+    "falar com atendente",
+    "atendente humano",
+    "outro assunto",
+    "esquece isso",
+    "deixa pra lá",
+    "deixa pra la",
+    "não quero mais",
+    "nao quero mais",
+)
+
+
+def contem_sinal_de_desistencia(texto: str) -> bool:
+    """Detecta sinais claros de desabafo/desistência durante um fluxo já em
+    andamento (ex.: o cliente já estava respondendo "quanto pode pagar" e de
+    repente fala de desemprego).
+
+    Usado como um filtro deliberadamente mais permissivo que o classificador
+    de intenção da entrada da conversa: uma resposta apenas ambígua ou
+    incompleta ("não sei", "sei lá") a uma pergunta do fluxo NÃO deve
+    encerrar a conversa — só sinais explícitos de desistência devem.
+    """
+
+    texto_normalizado = texto.strip().lower()
+    return any(sinal in texto_normalizado for sinal in _SINAIS_DE_DESISTENCIA_MEIO_FLUXO)
+
+
+_ESCOLHA_ORDINAIS = {
+    "primeira": 0,
+    "1a": 0,
+    "1ª": 0,
+    "segunda": 1,
+    "2a": 1,
+    "2ª": 1,
+}
+
+
+def extrair_escolha_oferta(texto: str, n_ofertas: int) -> int | None:
+    """Interpreta a escolha do cliente entre as ofertas apresentadas (0-based).
+
+    Aceita "1"/"2", "opção 1"/"opção 2", "primeira"/"segunda", ou frases como
+    "quero a 2", "aceito a primeira", "fecho com a opção 1".
+    """
+
+    if n_ofertas <= 0:
+        return None
+
+    texto_normalizado = texto.strip().lower()
+    if not texto_normalizado:
+        return None
+
+    for palavra, indice in _ESCOLHA_ORDINAIS.items():
+        if palavra in texto_normalizado and indice < n_ofertas:
+            return indice
+
+    match = re.search(r"\b([1-9])\b", texto_normalizado)
+    if match:
+        indice = int(match.group(1)) - 1
+        if 0 <= indice < n_ofertas:
+            return indice
+
+    return None
+
+
+================================================================================
+ARQUIVO: ./.streamlit/config.toml
+================================================================================
+[theme]
+base = "light"
+primaryColor = "#0B2A6B"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F5"
+textColor = "#1A1F36"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+
+[server]
+headless = true
+
+
+================================================================================
+ARQUIVO: ./tests/__init__.py
+================================================================================
+
+
+================================================================================
+ARQUIVO: ./tests/test_agents.py
+================================================================================
+"""Testes de integração do grafo LangGraph (roda em modo simulado, sem LLM).
+
+Cada teste limpa o cache do grafo antes e depois de rodar (`obter_grafo` é
+`lru_cache`d por processo) para garantir que o `MemorySaver` — e portanto o
+histórico de conversa — não vaze de um teste para o outro mesmo quando dois
+testes usam o mesmo `cart_id` de demonstração.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from src.agents import orquestrador
+from src.agents.graph import obter_grafo
+from src.agents.state import Estagio
+from src.domain.models import CarrinhoAbandonado
+from src.services.poneiu_api import PoneIUBankAPI
+
+
+@pytest.fixture(autouse=True)
+def _grafo_isolado_por_teste():
+    obter_grafo.cache_clear()
+    yield
+    obter_grafo.cache_clear()
+
+
+def _carrinho(cart_id: str) -> CarrinhoAbandonado:
+    carrinho = PoneIUBankAPI().obter_carrinho(cart_id)
+    assert carrinho is not None
+    return carrinho
+
+
+def test_fluxo_feliz_completo():
+    carrinho = _carrinho("cart-cartao-001")
+
+    estado = orquestrador.iniciar_conversa(carrinho)
+    assert estado["estagio"] == Estagio.AGUARDANDO_VALOR.value
+
+    estado = orquestrador.enviar_mensagem(carrinho.cart_id, "consigo pagar uns 300 reais por mes")
+    assert estado["estagio"] == Estagio.AGUARDANDO_ESCOLHA.value
+    assert len(estado["ofertas_apresentadas"]) == 2
+
+    estado = orquestrador.enviar_mensagem(carrinho.cart_id, "quero a opção 2")
+    assert estado["estagio"] == Estagio.CONCLUIDO.value
+    assert estado["protocolo_confirmacao"].startswith("PONEIU-")
+
+
+def test_valor_nao_reconhecido_repete_a_pergunta_sem_travar():
+    carrinho = _carrinho("cart-lic-001")
+    orquestrador.iniciar_conversa(carrinho)
+
+    estado = orquestrador.enviar_mensagem(carrinho.cart_id, "não faço ideia, sei lá")
+    assert estado["estagio"] == Estagio.AGUARDANDO_VALOR.value
+
+
+def test_iniciar_conversa_e_idempotente():
+    carrinho = _carrinho("cart-lic-001")
+    primeiro = orquestrador.iniciar_conversa(carrinho)
+    segundo = orquestrador.iniciar_conversa(carrinho)
+    assert len(segundo["messages"]) == len(primeiro["messages"])
+
+
+def test_gatekeeper_encerra_mensagem_fora_de_topico():
+    carrinho = _carrinho("cart-pronampe-001")
+    orquestrador.iniciar_conversa(carrinho)
+
+    estado = orquestrador.enviar_mensagem(
+        carrinho.cart_id, "perdi meu emprego, não aguento mais nada, não sei o que fazer"
+    )
+    assert estado["estagio"] == Estagio.ENCERRADO_HUMANO.value
+
+
+def test_gatekeeper_permite_reabrir_apos_encerramento():
+    carrinho = _carrinho("cart-cartao-001")
+    orquestrador.iniciar_conversa(carrinho)
+    orquestrador.enviar_mensagem(carrinho.cart_id, "só queria desabafar, sem condições de pagar nada")
+
+    estado = orquestrador.enviar_mensagem(carrinho.cart_id, "quero retomar a negociação")
+    assert estado["estagio"] == Estagio.AGUARDANDO_VALOR.value
+
+
+================================================================================
+ARQUIVO: ./tests/test_poneiu_api.py
+================================================================================
+import pytest
+
+from src.domain.models import Produto
+from src.services.poneiu_api import PoneIUBankAPI
+
+
+def test_lista_tres_carrinhos_abandonados():
+    api = PoneIUBankAPI()
+    carrinhos = api.listar_carrinhos_abandonados()
+    assert len(carrinhos) == 3
+    assert {c.produto for c in carrinhos} == {Produto.CARTAO, Produto.LIC, Produto.PRONAMPE}
+
+
+def test_cardapio_e_deterministico_por_cart_id():
+    api = PoneIUBankAPI()
+    primeira = api.gerar_cardapio_completo("cart-cartao-001")
+    segunda = api.gerar_cardapio_completo("cart-cartao-001")
+    assert [o.valor_parcela for o in primeira] == [o.valor_parcela for o in segunda]
+
+
+def test_simular_opcoes_mais_proximas_retorna_as_duas_mais_proximas():
+    api = PoneIUBankAPI()
+    cardapio = api.gerar_cardapio_completo("cart-lic-001")
+    escolhidas = api.simular_opcoes_mais_proximas("cart-lic-001", valor_pretendido=600, max_opcoes=2)
+
+    assert len(escolhidas) == 2
+    diffs_escolhidas = sorted(abs(o.valor_parcela - 600) for o in escolhidas)
+    diffs_todas = sorted(abs(o.valor_parcela - 600) for o in cardapio)
+    assert diffs_escolhidas == diffs_todas[:2]
+
+
+def test_confirmar_contratacao_gera_protocolo_poneiu():
+    api = PoneIUBankAPI()
+    oferta = api.gerar_cardapio_completo("cart-pronampe-001")[0]
+    confirmacao = api.confirmar_contratacao("cart-pronampe-001", oferta)
+
+    assert confirmacao.protocolo.startswith("PONEIU-")
+    assert confirmacao.status == "CONTRATADO"
+    assert confirmacao.oferta is oferta
+
+
+def test_carrinho_inexistente_leva_a_erro():
+    api = PoneIUBankAPI()
+    with pytest.raises(ValueError):
+        api.gerar_cardapio_completo("nao-existe")
+
+
+================================================================================
+ARQUIVO: ./tests/test_utils.py
+================================================================================
+import pytest
+
+from src.utils import extrair_escolha_oferta, extrair_valor_monetario, format_brl
+
+
+@pytest.mark.parametrize(
+    "texto,esperado",
+    [
+        ("consigo pagar 300 reais", 300.0),
+        ("R$ 1.200,50 por mes", 1200.50),
+        ("uns 450 por mes", 450.0),
+        ("não consigo pagar nada esse mês", None),
+        ("", None),
+    ],
+)
+def test_extrair_valor_monetario(texto, esperado):
+    assert extrair_valor_monetario(texto) == esperado
+
+
+def test_format_brl():
+    assert format_brl(1234.5) == "R$ 1.234,50"
+    assert format_brl(90) == "R$ 90,00"
+
+
+@pytest.mark.parametrize(
+    "texto,n_ofertas,esperado",
+    [
+        ("quero a 1", 2, 0),
+        ("prefiro a segunda opção", 2, 1),
+        ("opção 2 por favor", 2, 1),
+        ("não sei ainda", 2, None),
+    ],
+)
+def test_extrair_escolha_oferta(texto, n_ofertas, esperado):
+    assert extrair_escolha_oferta(texto, n_ofertas) == esperado
+
+
