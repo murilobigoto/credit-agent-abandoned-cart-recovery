@@ -1,7 +1,5 @@
 # PoneIU · Ecossistema agêntico de renegociação de carrinho abandonado
 
-> **Nome sugerido para o repositório no GitHub:** `poneiu-renegocia-agentic`
-> (alternativas: `poneiu-agentic-recovery`, `poneiu-desenrola-agents`)
 
 Simulação completa — agentes de IA + interface bancária — de um fluxo real
 de **retomada de renegociação de dívida** para um banco fictício chamado
@@ -28,7 +26,7 @@ pelo usuário).
 |---|---|---|---|---|
 | ![Tela principal](docs/screenshots/01_tela_principal.png) | ![Abertura do chat](docs/screenshots/02_chat_abertura.png) | ![Apresentação de ofertas](docs/screenshots/03_chat_ofertas.png) | ![Confirmação](docs/screenshots/04_chat_confirmacao.png) | ![Encerramento humanizado](docs/screenshots/05_chat_gatekeeper.png) |
 
-> 📚 Para a teoria por trás da arquitetura (por que LangGraph, desenho do
+> Para a teoria por trás da arquitetura (por que LangGraph, desenho do
 > grafo, onde o LLM entra e onde ele deliberadamente não entra, etc.), veja
 > **[docs/ARQUITETURA.md](docs/ARQUITETURA.md)**.
 
