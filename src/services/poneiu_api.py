@@ -25,7 +25,7 @@ from src.domain.models import (
 # Banda de taxa mensal (mín, máx) por produto. Reflete de forma simplificada
 # o perfil de risco/subsídio real de cada linha:
 # - Cartão: dívida rotativa já vencida -> taxas mais altas.
-# - LIC: crédito pessoal, risco intermediário.
+# - LIC: limite de crédito vinculado à conta, risco intermediário.
 # - Pronampe: linha para PJ com funding subsidiado pelo governo -> taxas
 #   mais baixas e prazos mais longos (fiel ao produto real).
 _TAXAS_MENSAIS: dict[Produto, tuple[float, float]] = {

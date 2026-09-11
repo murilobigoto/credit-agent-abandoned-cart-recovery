@@ -34,11 +34,19 @@ def _api() -> PoneIUBankAPI:
 
 
 api = _api()
+carrinhos = api.listar_carrinhos_abandonados()
+maior_desconto = max(
+    (api.gerar_cardapio_completo(carrinho.cart_id)[0].desconto_percentual for carrinho in carrinhos),
+    default=0.0,
+)
 
 components.render_header()
-components.render_hero()
+components.render_hero(carrinhos)
+components.render_resumo(carrinhos, maior_desconto)
 components.render_desenrola_card()
-components.render_formas_reorganizar(api.listar_carrinhos_abandonados())
+components.render_formas_reorganizar(carrinhos)
+components.render_ajuda()
+components.render_footer()
 
 carrinho_ativo_id = st.session_state.get("carrinho_ativo_id")
 if carrinho_ativo_id:

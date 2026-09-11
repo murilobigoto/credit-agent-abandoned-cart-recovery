@@ -23,8 +23,8 @@ class Produto(str, Enum):
     @property
     def rotulo(self) -> str:
         return {
-            Produto.CARTAO: "Cartão PoneIU Personnalité",
-            Produto.LIC: "LIC PoneIU (Linha de Crédito Individual)",
+            Produto.CARTAO: "Cartão PoneIU",
+            Produto.LIC: "LIC PoneIU (Limite da Conta)",
             Produto.PRONAMPE: "Pronampe PoneIU (crédito para PJ)",
         }[self]
 
@@ -32,7 +32,7 @@ class Produto(str, Enum):
     def descricao_curta(self) -> str:
         return {
             Produto.CARTAO: "Fatura de cartão de crédito em atraso",
-            Produto.LIC: "Linha de crédito pessoal pré-aprovada",
+            Produto.LIC: "Limite de crédito pré-aprovado vinculado à sua conta",
             Produto.PRONAMPE: "Capital de giro para micro e pequenas empresas",
         }[self]
 

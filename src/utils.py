@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
 
 def format_brl(valor: float) -> str:
@@ -11,6 +12,23 @@ def format_brl(valor: float) -> str:
     texto = f"{valor:,.2f}"
     texto = texto.replace(",", "#").replace(".", ",").replace("#", ".")
     return f"R$ {texto}"
+
+
+def formatar_data_relativa(data_str: str, referencia: datetime | None = None) -> str:
+    """Converte "dd/mm/aaaa" em um texto relativo curto ("hoje", "ontem", "há N dias").
+
+    Usado na lista de carrinhos abandonados para reforçar o senso de tempo
+    sem esconder a data exata (que continua exibida ao lado).
+    """
+
+    referencia = referencia or datetime.now()
+    data = datetime.strptime(data_str, "%d/%m/%Y")
+    dias = (referencia.date() - data.date()).days
+    if dias <= 0:
+        return "hoje"
+    if dias == 1:
+        return "ontem"
+    return f"há {dias} dias"
 
 
 _VALOR_REGEX = re.compile(

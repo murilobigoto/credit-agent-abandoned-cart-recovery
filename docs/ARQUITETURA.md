@@ -289,7 +289,7 @@ aquele estado apontar para um carrinho — cliques em botões e o
 `st.chat_input` dentro do diálogo disparam reruns normais do Streamlit, e o
 diálogo permanece aberto porque a condição continua verdadeira.
 
-O clique do cliente em uma linha da lista ("CARTÃO PONEIU PERSONNALITÉ",
+O clique do cliente em uma linha da lista ("CARTÃO PONEIU",
 etc.) já **é**, na simulação, a manifestação de "quero retomar minha
 renegociação" — por isso a UI não precisa de um caminho especial: ela só
 chama `orquestrador.iniciar_conversa(carrinho)`, que injeta uma mensagem
